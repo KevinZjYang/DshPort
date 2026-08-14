@@ -169,8 +169,6 @@ function shouldPruneDirectory(name) {
     '.github',
     '.yarn',
     '__tests__',
-    'doc',
-    'docs',
     'example',
     'examples',
     'test',
