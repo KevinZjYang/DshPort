@@ -27,6 +27,10 @@ function ensureDirectories() {
 }
 
 function getVersion() {
+  return app.getVersion()
+}
+
+function getHarnessVersion() {
   const manifestPath = join(runtimeRoot, 'harness', 'package.json')
   if (!existsSync(manifestPath)) return app.getVersion()
   try {
@@ -303,8 +307,8 @@ function launchUpdater(release) {
     return
   }
   const tagName = String(release.tag_name)
-  const component = release.assets?.some(asset => asset.name === 'harness-runtime.zip') ? 'harness' : 'portable'
-  spawn(nodePath, [updater, process.execPath, tagName, UPDATE_REPOSITORY, component], {
+  const component = release.assets?.some(asset => /DshPort-win-x64\.zip$/u.test(asset.name)) ? 'portable' : 'harness'
+  spawn(nodePath, [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)], {
     detached: true,
     windowsHide: true,
     stdio: 'ignore',
@@ -318,8 +322,8 @@ async function showAbout() {
     title: `About ${APP_NAME}`,
     message: APP_NAME,
     detail: [
-      `Harness version: ${getVersion()}`,
-      `Desktop version: ${app.getVersion()}`,
+      `Desktop version: ${getVersion()}`,
+      `Harness version: ${getHarnessVersion()}`,
       `Data: ${dataRoot}`,
       `Logs: ${logsRoot}`,
     ].join('\n'),

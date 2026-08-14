@@ -38,6 +38,10 @@ GitHub Actions 每 6 小时检测一次上游：
 
 也可以在 GitHub Actions 页面手动运行 workflow，指定上游 ref 或 DshPort 发布版本。
 
+## 应用内更新
+
+DshPort 启动时会检查 `KevinZjYang/DshPort` 的最新 Release；窗口顶部也有“检查更新”按钮。发现新版本后，用户确认即可下载 `DshPort-win-x64.zip` 并替换程序文件，`data/` 下的配置、会话和工作区会保留。
+
 ## 本地构建
 
 ```sh

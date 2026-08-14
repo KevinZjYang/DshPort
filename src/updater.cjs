@@ -8,7 +8,7 @@ const { request } = require('node:https')
 const { spawn } = require('node:child_process')
 const { releaseTagUrl } = require('./portable-paths.cjs')
 
-const [, , executablePath, version, repository, component = 'auto'] = process.argv
+const [, , executablePath, version, repository, component = 'auto', parentPid] = process.argv
 if (!executablePath || !version || !repository) process.exit(2)
 
 function getJson(url) {
@@ -86,6 +86,19 @@ async function replaceDirectory(target, source) {
   }
 }
 
+async function waitForProcessExit(pid, timeoutMs = 30000) {
+  if (!pid || !/^\d+$/u.test(pid)) return
+  const started = Date.now()
+  while (Date.now() - started < timeoutMs) {
+    try {
+      process.kill(Number(pid), 0)
+      await new Promise(resolve => setTimeout(resolve, 500))
+    } catch {
+      return
+    }
+  }
+}
+
 async function updateHarnessRuntime(release, temp) {
   const asset = release.assets?.find(item => item.name === 'harness-runtime.zip')
   if (!asset) return false
@@ -120,6 +133,7 @@ async function updateWholePortable(release, temp) {
 async function main() {
   const release = await getJson(releaseTagUrl(repository, version))
   const temp = await mkdtemp(join(tmpdir(), 'dsh-update-'))
+  await waitForProcessExit(parentPid)
   const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
   if (!updatedHarness) await updateWholePortable(release, temp)
   spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' }).unref()
