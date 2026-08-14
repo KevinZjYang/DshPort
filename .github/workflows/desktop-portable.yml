@@ -108,6 +108,7 @@ jobs:
         with:
           node-version: '24.14.0'
           cache: pnpm
+      - run: corepack enable
       - run: pnpm install --frozen-lockfile
       - run: node scripts/build-runtime.mjs
         env:
