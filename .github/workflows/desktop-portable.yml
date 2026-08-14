@@ -153,6 +153,8 @@ jobs:
         env:
           DSH_SOURCE_REF: ${{ needs.detect-upstream.outputs.upstream_ref }}
       - run: node scripts/package.mjs --zip
+        env:
+          DSHPORT_VERSION: ${{ needs.detect-upstream.outputs.release_tag }}
       - uses: actions/upload-artifact@v4
         with:
           name: DshPort-win-x64

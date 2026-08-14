@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { cp, mkdir, readdir, readFile, rm, rename, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readFile, rm, rename, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -47,6 +47,22 @@ async function findRcedit(root) {
   return undefined
 }
 
+async function verifyPackagedHarness(root) {
+  const nodeModules = join(root, 'resources', 'harness', 'node_modules')
+  for (const dependency of [
+    join(nodeModules, '@deepseek-ai', 'dsh-app-boot'),
+    join(nodeModules, '@earendil-works', 'pi-ai'),
+    join(nodeModules, '@img', 'sharp-win32-x64'),
+    join(nodeModules, 'sharp'),
+    join(nodeModules, 'typebox'),
+  ]) {
+    const stat = await lstat(dependency)
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Packaged Harness dependency is not a real directory: ${dependency}`)
+    }
+  }
+}
+
 async function main() {
   await rm(unpackedRoot, { recursive: true, force: true })
   await mkdir(outputRoot, { recursive: true })
@@ -63,6 +79,7 @@ async function main() {
   await cp(join(projectRoot, 'src'), join(appRoot, 'src'), { recursive: true })
   await cp(join(projectRoot, 'resources'), join(appRoot, 'resources'), { recursive: true })
   const manifest = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8'))
+  manifest.version = (process.env.DSHPORT_VERSION || manifest.version).replace(/^v/u, '')
   delete manifest.devDependencies
   delete manifest.build
   manifest.main = 'src/main.cjs'
@@ -71,6 +88,7 @@ async function main() {
   await cp(join(projectRoot, 'runtime', 'node'), join(unpackedRoot, 'resources', 'node'), { recursive: true })
   await cp(join(projectRoot, 'runtime', 'harness'), join(unpackedRoot, 'resources', 'harness'), { recursive: true })
   await cp(join(projectRoot, 'runtime', 'updater'), join(unpackedRoot, 'resources', 'updater'), { recursive: true })
+  await verifyPackagedHarness(unpackedRoot)
 
   if (wantsZip) {
     const archive = join(outputRoot, 'DshPort-win-x64.zip')
