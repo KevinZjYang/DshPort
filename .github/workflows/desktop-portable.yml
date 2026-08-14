@@ -156,6 +156,7 @@ jobs:
       - run: node scripts/package.mjs --zip
         env:
           DSHPORT_VERSION: ${{ needs.detect-upstream.outputs.release_tag }}
+      - run: npm run smoke:package
       - uses: actions/upload-artifact@v4
         with:
           name: DshPort-win-x64

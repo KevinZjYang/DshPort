@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path'
 const root = resolve(import.meta.dirname, '..')
 const zip = join(root, 'dist-exe', 'desktop', 'DshPort-win-x64.zip')
 const probe = join(root, 'dist-exe', 'zip-smoke')
-const port = Number(process.env.DSHPORT_SMOKE_PORT || 3109)
+const port = Number(process.env.DSHPORT_SMOKE_PORT || 32000 + Math.floor(Math.random() * 10000))
 
 function run(command, args, options = {}) {
   return new Promise((resolveRun, reject) => {
@@ -20,6 +20,7 @@ async function poll() {
   let lastError = ''
   for (let i = 0; i < 120; i += 1) {
     await new Promise(resolve => setTimeout(resolve, 500))
+    if (appProcess?.exitCode !== null) throw new Error(`DshPort exited early with code ${appProcess.exitCode}`)
     try {
       const response = await fetch(`http://127.0.0.1:${port}`)
       if (response.status < 500) return response.status
@@ -31,6 +32,17 @@ async function poll() {
   throw new Error(lastError || 'not ready')
 }
 
+let appProcess
+
+function killTree(child) {
+  if (!child.pid || child.killed) return
+  if (process.platform === 'win32') {
+    spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+    return
+  }
+  child.kill()
+}
+
 async function main() {
   await rm(probe, { recursive: true, force: true })
   await mkdir(probe, { recursive: true })
@@ -39,7 +51,7 @@ async function main() {
   const exe = join(probe, 'DshPort.exe')
   if (!existsSync(exe)) throw new Error(`Missing ${exe}`)
 
-  const child = spawn(exe, {
+  appProcess = spawn(exe, {
     cwd: probe,
     detached: false,
     windowsHide: true,
@@ -53,9 +65,9 @@ async function main() {
 
   try {
     const status = await poll()
-    console.log(`ZIP_SMOKE_READY=true STATUS=${status} PID=${child.pid}`)
+    console.log(`ZIP_SMOKE_READY=true STATUS=${status} PID=${appProcess.pid} PORT=${port}`)
   } finally {
-    if (!child.killed) child.kill()
+    killTree(appProcess)
   }
 
   const logPath = join(probe, 'data', 'logs', 'harness.log')

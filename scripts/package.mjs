@@ -64,6 +64,13 @@ async function verifyPackagedHarness(root) {
       throw new Error(`Packaged Harness dependency is not a real directory: ${dependency}`)
     }
   }
+  for (const file of [
+    join(nodeModules, 'yaml', 'dist', 'doc', 'directives.js'),
+    join(nodeModules, 'koffi', 'src', 'koffi', 'index.js'),
+  ]) {
+    const stat = await lstat(file)
+    if (!stat.isFile()) throw new Error(`Packaged Harness runtime file is missing: ${file}`)
+  }
 }
 
 async function pruneElectronRuntime(root) {

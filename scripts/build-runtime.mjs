@@ -100,6 +100,8 @@ async function prepareHarness() {
   await exposeInstalledDshPackage()
   await pruneHarnessRuntime()
   await verifyMaterializedWorkspacePackages(join(harnessRoot, 'node_modules', '@deepseek-ai'))
+  await verifyRuntimeDependency(join(harnessRoot, 'node_modules', 'yaml', 'dist', 'doc', 'directives.js'))
+  await verifyRuntimeDependency(join(harnessRoot, 'node_modules', 'koffi', 'src', 'koffi', 'index.js'))
 }
 
 async function installDshPackage(packageSpec) {
@@ -153,7 +155,7 @@ async function pruneTree(root) {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name)
     if (entry.isDirectory()) {
-      if (shouldPruneDirectory(entry.name) || await isCompiledPackageSource(root, entry.name)) {
+      if (shouldPruneDirectory(entry.name)) {
         await rm(path, { recursive: true, force: true })
         continue
       }
@@ -176,12 +178,6 @@ function shouldPruneDirectory(name) {
   ]).has(name)
 }
 
-async function isCompiledPackageSource(parent, name) {
-  if (name !== 'src') return false
-  if (!(await exists(join(parent, 'package.json')))) return false
-  return await exists(join(parent, 'lib')) || await exists(join(parent, 'dist')) || await exists(join(parent, 'build'))
-}
-
 function shouldPruneFile(name) {
   const lower = name.toLowerCase()
   return lower.endsWith('.map')
@@ -190,6 +186,11 @@ function shouldPruneFile(name) {
     || lower === 'readme.md'
     || lower === 'changelog.md'
     || lower === 'changes.md'
+}
+
+async function verifyRuntimeDependency(path) {
+  const stat = await lstat(path)
+  if (!stat.isFile()) throw new Error(`Required runtime file is missing: ${path}`)
 }
 
 async function removeIfExists(path) {
