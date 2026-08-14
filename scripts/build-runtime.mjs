@@ -31,7 +31,7 @@ async function run(command, args, cwd = projectRoot) {
     const usesCmdShim = process.platform === 'win32' && ['npm', 'npx', 'pnpm'].includes(command)
     const executable = usesCmdShim ? process.env.ComSpec || 'cmd.exe' : command
     const executableArgs = usesCmdShim
-      ? ['/d', '/s', '/c', [command, ...args].map(quoteCmdArg).join(' ')]
+      ? ['/d', '/s', '/c', [command, ...args.map(quoteCmdArg)].join(' ')]
       : args
     const child = spawn(executable, executableArgs, { cwd, stdio: 'inherit', windowsHide: true })
     child.once('exit', code => code === 0 ? resolveRun() : reject(new Error(`${command} exited with ${code}`)))
