@@ -1,8 +1,8 @@
 {
   "name": "dshport",
   "private": true,
-  "version": "0.1.0-rc.5",
-  "description": "DshPort portable Windows desktop shell for DeepSeek Harness",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness 的 Windows 便携桌面壳",
   "type": "module",
   "main": "src/main.cjs",
   "scripts": {

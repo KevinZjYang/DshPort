@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: Optional upstream tag, branch, or commit to package
+        description: 可选，上游 tag、branch 或 commit
         required: false
       version:
-        description: Optional DshPort release version, for example 0.1.0-rc.5
+        description: 可选，DshPort 发布版本，例如 0.1.0
         required: false
       force:
-        description: Rebuild even when the DshPort release already exists
+        description: 即使同一上游版本已经发布也重新构建
         required: false
         default: 'false'
   schedule:
@@ -37,21 +37,21 @@ jobs:
             const upstreamOwner = 'deepseek-ai'
             const upstreamRepo = 'deepseek-harness'
             const forcedRef = '${{ github.event.inputs.upstream_ref }}'
-            const forcedVersion = '${{ github.event.inputs.version }}'
+            const forcedDshPortVersion = '${{ github.event.inputs.version }}'
             const force = '${{ github.event.inputs.force }}' === 'true'
 
             let upstreamRef = forcedRef
-            let upstreamVersion = forcedVersion
+            let upstreamVersion = ''
             let upstreamUrl = `https://github.com/${upstreamOwner}/${upstreamRepo}`
 
-            if (!upstreamRef || !upstreamVersion) {
+            if (!upstreamRef) {
               try {
                 const latest = await github.rest.repos.getLatestRelease({
                   owner: upstreamOwner,
                   repo: upstreamRepo,
                 })
-                upstreamRef ||= latest.data.tag_name
-                upstreamVersion ||= latest.data.tag_name.replace(/^v/, '')
+                upstreamRef = latest.data.tag_name
+                upstreamVersion = latest.data.tag_name.replace(/^v/, '')
                 upstreamUrl = latest.data.html_url
               } catch (error) {
                 if (error.status !== 404) throw error
@@ -69,26 +69,65 @@ jobs:
                   return
                 }
                 const firstLine = releaseCommit.commit.message.split('\n')[0]
-                upstreamVersion ||= firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)[1]
-                upstreamRef ||= releaseCommit.sha
+                upstreamVersion = firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)[1]
+                upstreamRef = releaseCommit.sha
                 upstreamUrl = releaseCommit.html_url
               }
             }
 
-            const releaseTag = `v${upstreamVersion.replace(/^v/, '')}`
-            let exists = false
+            if (!upstreamVersion) {
+              const commit = await github.rest.repos.getCommit({
+                owner: upstreamOwner,
+                repo: upstreamRepo,
+                ref: upstreamRef,
+              })
+              const firstLine = commit.data.commit.message.split('\n')[0]
+              const match = firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)
+              upstreamVersion = match ? match[1] : upstreamRef
+              upstreamUrl = commit.data.html_url
+            }
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            })
+
+            const alreadyReleased = releases.some(release =>
+              release.body?.includes(`上游版本：${upstreamVersion}`) ||
+              release.body?.includes(`上游引用：${upstreamRef}`),
+            )
+
+            const stableVersions = releases
+              .map(release => release.tag_name.match(/^v(\d+)\.(\d+)\.(\d+)$/))
+              .filter(Boolean)
+              .map(match => match.slice(1).map(Number))
+              .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2])
+
+            let dshPortVersion = forcedDshPortVersion.replace(/^v/, '')
+            if (!dshPortVersion) {
+              if (stableVersions.length === 0) {
+                dshPortVersion = '0.1.0'
+              } else {
+                const latest = stableVersions.at(-1)
+                dshPortVersion = `${latest[0]}.${latest[1]}.${latest[2] + 1}`
+              }
+            }
+
+            const releaseTag = `v${dshPortVersion}`
+            let tagExists = false
             try {
               await github.rest.repos.getReleaseByTag({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 tag: releaseTag,
               })
-              exists = true
+              tagExists = true
             } catch (error) {
               if (error.status !== 404) throw error
             }
 
-            core.setOutput('should_build', String(force || !exists))
+            core.setOutput('should_build', String(force || (!alreadyReleased && !tagExists)))
             core.setOutput('upstream_ref', upstreamRef)
             core.setOutput('upstream_version', upstreamVersion)
             core.setOutput('release_tag', releaseTag)
@@ -125,17 +164,18 @@ jobs:
         with:
           tag_name: ${{ needs.detect-upstream.outputs.release_tag }}
           name: ${{ needs.detect-upstream.outputs.release_title }}
-          prerelease: ${{ contains(needs.detect-upstream.outputs.release_tag, '-') }}
+          prerelease: false
           body: |
-            Automated DshPort portable build.
+            DshPort Windows 便携版自动构建。
 
-            Upstream source: ${{ needs.detect-upstream.outputs.upstream_url }}
-            Upstream ref: ${{ needs.detect-upstream.outputs.upstream_ref }}
+            上游项目：${{ needs.detect-upstream.outputs.upstream_url }}
+            上游版本：${{ needs.detect-upstream.outputs.upstream_version }}
+            上游引用：${{ needs.detect-upstream.outputs.upstream_ref }}
 
-            Assets:
-            - DshPort-win-x64.zip: complete portable Windows x64 package
-            - harness-runtime.zip: Harness runtime-only update package
-            - SHA256SUMS.txt: SHA-256 checksums
+            下载说明：
+            - DshPort-win-x64.zip：完整 Windows x64 便携包，首次使用下载这个
+            - harness-runtime.zip：仅 Harness 运行时更新包，供后续增量更新使用
+            - SHA256SUMS.txt：SHA-256 校验文件
           files: |
             dist-exe/desktop/DshPort-win-x64.zip
             dist-exe/desktop/harness-runtime.zip
