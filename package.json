@@ -9,6 +9,7 @@
     "build": "node scripts/build-runtime.mjs",
     "package": "node scripts/package.mjs",
     "package:portable": "node scripts/package.mjs --zip",
+    "smoke:package": "node scripts/smoke-package.mjs",
     "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
