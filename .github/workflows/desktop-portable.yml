@@ -152,6 +152,7 @@ jobs:
       - run: node scripts/build-runtime.mjs
         env:
           DSH_SOURCE_REF: ${{ needs.detect-upstream.outputs.upstream_ref }}
+          DSH_PACKAGE_VERSION: ${{ needs.detect-upstream.outputs.upstream_version }}
       - run: node scripts/package.mjs --zip
         env:
           DSHPORT_VERSION: ${{ needs.detect-upstream.outputs.release_tag }}

@@ -1,9 +1,8 @@
-import { createWriteStream, existsSync } from 'node:fs'
-import { access, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { createWriteStream } from 'node:fs'
+import { access, cp, lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import sharp from 'sharp'
 import pngToIco from 'png-to-ico'
@@ -96,161 +95,107 @@ async function prepareNode() {
 
 async function prepareHarness() {
   await rm(harnessRoot, { recursive: true, force: true })
-  await run('pnpm', ['install'], sourceRoot)
-  await run('pnpm', ['run', 'build'], sourceRoot)
-  await run('pnpm', ['deploy', '--legacy', '--filter', '@deepseek-ai/dsh', '--prod', harnessRoot], sourceRoot)
-  await materializeWorkspaceClosure()
+  await mkdir(harnessRoot, { recursive: true })
+  await installDshPackage(await resolveDshPackageSpec())
+  await exposeInstalledDshPackage()
+  await pruneHarnessRuntime()
   await verifyMaterializedWorkspacePackages(join(harnessRoot, 'node_modules', '@deepseek-ai'))
 }
 
-async function materializeWorkspaceClosure() {
-  const workspacePackages = new Map()
-  await collectWorkspacePackages(sourceRoot, workspacePackages)
-  const pendingWorkspace = Array.from(workspacePackages.keys())
-  const pendingExternal = []
-  const visitedWorkspace = new Set()
-  const visitedExternal = new Set()
-  while (pendingWorkspace.length > 0 || pendingExternal.length > 0) {
-    const name = pendingWorkspace.pop()
-    if (name !== undefined) {
-      if (visitedWorkspace.has(name)) continue
-      visitedWorkspace.add(name)
-      const packageRoot = workspacePackages.get(name)
-      if (!packageRoot) continue
-      await materializeWorkspacePackage(name, packageRoot)
-      await queueDependencies(packageRoot, workspacePackages, pendingWorkspace, pendingExternal)
+async function installDshPackage(packageSpec) {
+  await writeHarnessInstallManifest(packageSpec)
+  if (await tryRun('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/'], harnessRoot)) return
+  if (packageSpec === 'latest') throw new Error('npm could not install @deepseek-ai/dsh@latest')
+  console.warn(`Could not install @deepseek-ai/dsh@${packageSpec}; falling back to npm latest.`)
+  await rm(join(harnessRoot, 'node_modules'), { recursive: true, force: true })
+  await rm(join(harnessRoot, 'package-lock.json'), { force: true })
+  await writeHarnessInstallManifest('latest')
+  await run('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org/'], harnessRoot)
+}
+
+async function writeHarnessInstallManifest(packageSpec) {
+  await writeFile(join(harnessRoot, 'package.json'), `${JSON.stringify({
+    private: true,
+    dependencies: {
+      '@deepseek-ai/dsh': packageSpec,
+    },
+  }, null, 2)}\n`)
+}
+
+async function resolveDshPackageSpec() {
+  if (process.env.DSH_PACKAGE_SPEC !== undefined && process.env.DSH_PACKAGE_SPEC !== '') return process.env.DSH_PACKAGE_SPEC
+  if (process.env.DSH_PACKAGE_VERSION !== undefined && process.env.DSH_PACKAGE_VERSION !== '') {
+    return process.env.DSH_PACKAGE_VERSION.startsWith('@')
+      ? process.env.DSH_PACKAGE_VERSION
+      : process.env.DSH_PACKAGE_VERSION
+  }
+  const manifest = JSON.parse(await readFile(join(sourceRoot, 'apps', 'cli', 'package.json'), 'utf8'))
+  return manifest.version
+}
+
+async function exposeInstalledDshPackage() {
+  const dshPackageRoot = join(harnessRoot, 'node_modules', '@deepseek-ai', 'dsh')
+  await cp(join(dshPackageRoot, 'lib'), join(harnessRoot, 'lib'), { recursive: true })
+  await cp(join(dshPackageRoot, 'config'), join(harnessRoot, 'config'), { recursive: true })
+  for (const file of ['package.json', 'README.md', 'README.zh.md', 'README.i18n.yaml', 'LICENSE']) {
+    if (await exists(join(dshPackageRoot, file))) await cp(join(dshPackageRoot, file), join(harnessRoot, file))
+  }
+}
+
+async function pruneHarnessRuntime() {
+  await pruneTree(join(harnessRoot, 'node_modules'))
+  await removeIfExists(join(harnessRoot, 'node_modules', 'node-pty', 'prebuilds', 'win32-arm64'))
+  await removeIfExists(join(harnessRoot, 'node_modules', 'node-pty', 'third_party', 'conpty', '1.23.251008001', 'win10-arm64'))
+}
+
+async function pruneTree(root) {
+  if (!(await exists(root))) return
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name)
+    if (entry.isDirectory()) {
+      if (shouldPruneDirectory(entry.name) || await isCompiledPackageSource(root, entry.name)) {
+        await rm(path, { recursive: true, force: true })
+        continue
+      }
+      await pruneTree(path)
       continue
     }
-    const external = pendingExternal.pop()
-    if (external === undefined) continue
-    if (visitedExternal.has(external.name)) continue
-    const packageRoot = resolveDependencyPackage(external.name, external.from)
-    if (packageRoot === undefined) continue
-    visitedExternal.add(external.name)
-    await rm(packageTargetPath(external.name), { recursive: true, force: true })
-    await copyPackageWithoutNestedNodeModules(packageRoot, packageTargetPath(external.name))
-    await queueDependencies(packageRoot, workspacePackages, pendingWorkspace, pendingExternal)
+    if (entry.isFile() && shouldPruneFile(entry.name)) await rm(path, { force: true })
   }
 }
 
-async function queueDependencies(packageRoot, workspacePackages, pendingWorkspace, pendingExternal) {
-  const manifest = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
-  for (const deps of [manifest.dependencies, manifest.peerDependencies, manifest.optionalDependencies]) {
-    for (const [dependency, version] of Object.entries(deps || {})) {
-      if (dependency.startsWith('@deepseek-ai/') && String(version).startsWith('workspace:')) {
-        pendingWorkspace.push(dependency)
-      } else {
-        pendingExternal.push({ name: dependency, from: packageRoot })
-      }
-    }
-  }
+function shouldPruneDirectory(name) {
+  return new Set([
+    '.github',
+    '.yarn',
+    '__tests__',
+    'doc',
+    'docs',
+    'example',
+    'examples',
+    'test',
+    'tests',
+  ]).has(name)
 }
 
-function resolveDependencyPackage(name, from) {
-  try {
-    const requireFromPackage = createRequire(join(from, 'package.json'))
-    return dirname(requireFromPackage.resolve(`${name}/package.json`))
-  } catch {
-    return resolveDependencyPackageFromEntry(name, from)
-      || resolveDependencyPackageFromNodeModules(name, from)
-      || resolveDependencyPackageFromSharedPnpm(name)
-  }
+async function isCompiledPackageSource(parent, name) {
+  if (name !== 'src') return false
+  if (!(await exists(join(parent, 'package.json')))) return false
+  return await exists(join(parent, 'lib')) || await exists(join(parent, 'dist')) || await exists(join(parent, 'build'))
 }
 
-function resolveDependencyPackageFromEntry(name, from) {
-  try {
-    const requireFromPackage = createRequire(join(from, 'package.json'))
-    return findPackageRoot(requireFromPackage.resolve(name))
-  } catch {
-    return undefined
-  }
+function shouldPruneFile(name) {
+  const lower = name.toLowerCase()
+  return lower.endsWith('.map')
+    || lower.endsWith('.pdb')
+    || lower.endsWith('.tsbuildinfo')
+    || lower === 'readme.md'
+    || lower === 'changelog.md'
+    || lower === 'changes.md'
 }
 
-function findPackageRoot(path) {
-  let current = dirname(path)
-  while (current !== dirname(current)) {
-    if (existsSync(join(current, 'package.json'))) return current
-    current = dirname(current)
-  }
-  return undefined
-}
-
-function resolveDependencyPackageFromNodeModules(name, from) {
-  let current = from
-  while (current !== dirname(current)) {
-    const candidate = packagePathUnder(join(current, 'node_modules'), name)
-    if (existsSync(join(candidate, 'package.json'))) return candidate
-    current = dirname(current)
-  }
-  return undefined
-}
-
-function packagePathUnder(root, name) {
-  if (!name.startsWith('@')) return join(root, name)
-  const [scope, packageName] = name.split('/')
-  return join(root, scope, packageName)
-}
-
-function resolveDependencyPackageFromSharedPnpm(name) {
-  const candidate = packagePathUnder(join(sourceRoot, 'node_modules', '.pnpm', 'node_modules'), name)
-  if (existsSync(join(candidate, 'package.json'))) return candidate
-  return undefined
-}
-
-function packageTargetPath(name) {
-  if (name.startsWith('@')) {
-    const [scope, packageName] = name.split('/')
-    return join(harnessRoot, 'node_modules', scope, packageName)
-  }
-  return join(harnessRoot, 'node_modules', name)
-}
-
-async function materializeWorkspacePackage(name, source) {
-  const packagePath = packageTargetPath(name)
-  if (await exists(packagePath)) {
-    const stat = await lstat(packagePath)
-    if (!stat.isSymbolicLink() && stat.isDirectory()) return
-  }
-  await rm(packagePath, { recursive: true, force: true })
-  await copyPackageWithoutNestedNodeModules(source, packagePath)
-}
-
-async function collectWorkspacePackages(root, packages) {
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist-exe') continue
-    const path = join(root, entry.name)
-    if (!entry.isDirectory()) continue
-    const manifestPath = join(path, 'package.json')
-    if (await exists(manifestPath)) {
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
-      if (typeof manifest.name === 'string' && manifest.name.startsWith('@deepseek-ai/')) packages.set(manifest.name, path)
-    }
-    await collectWorkspacePackages(path, packages)
-  }
-}
-
-async function copyPackageWithoutNestedNodeModules(source, target, seen = new Set()) {
-  const stat = await lstat(source)
-  const resolved = stat.isSymbolicLink() ? await realpath(source) : source
-  const resolvedStat = stat.isSymbolicLink() ? await lstat(resolved) : stat
-  if (resolvedStat.isDirectory()) {
-    const real = await realpath(resolved)
-    if (seen.has(real)) return
-    seen.add(real)
-    await mkdir(target, { recursive: true })
-    for (const entry of await readdir(resolved)) {
-      if (entry === '.git' || entry === 'node_modules') continue
-      await copyPackageWithoutNestedNodeModules(join(resolved, entry), join(target, entry), seen)
-    }
-    seen.delete(real)
-    return
-  }
-  if (resolvedStat.isFile()) {
-    await mkdir(dirname(target), { recursive: true })
-    await copyFile(resolved, target)
-    return
-  }
-  if (basename(resolved) !== 'node_modules') await cp(resolved, target, { recursive: true, dereference: true })
+async function removeIfExists(path) {
+  await rm(path, { recursive: true, force: true })
 }
 
 async function verifyMaterializedWorkspacePackages(scopeRoot) {

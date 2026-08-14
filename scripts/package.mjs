@@ -10,6 +10,9 @@ const outputRoot = join(projectRoot, 'dist-exe', 'desktop')
 const unpackedRoot = join(outputRoot, 'win-unpacked')
 const appRoot = join(unpackedRoot, 'resources', 'app')
 const electronDist = resolve(projectRoot, 'node_modules', 'electron', 'dist')
+const harnessRuntimeRoot = process.env.DSH_HARNESS_RUNTIME_DIR === undefined
+  ? join(projectRoot, 'runtime', 'harness')
+  : resolve(process.env.DSH_HARNESS_RUNTIME_DIR)
 const wantsZip = process.argv.includes('--zip')
 
 async function run(command, args, cwd = projectRoot) {
@@ -63,10 +66,22 @@ async function verifyPackagedHarness(root) {
   }
 }
 
+async function pruneElectronRuntime(root) {
+  const locales = join(root, 'locales')
+  const keepLocales = new Set(['en-US.pak', 'zh-CN.pak'])
+  for (const entry of await readdir(locales, { withFileTypes: true }).catch(() => [])) {
+    if (entry.isFile() && !keepLocales.has(entry.name)) await rm(join(locales, entry.name), { force: true })
+  }
+  for (const file of ['LICENSE', 'LICENSES.chromium.html', 'version']) {
+    await rm(join(root, file), { force: true })
+  }
+}
+
 async function main() {
   await rm(unpackedRoot, { recursive: true, force: true })
   await mkdir(outputRoot, { recursive: true })
   await cp(electronDist, unpackedRoot, { recursive: true })
+  await pruneElectronRuntime(unpackedRoot)
   const exe = join(unpackedRoot, 'electron.exe')
   const appExe = join(unpackedRoot, 'DshPort.exe')
   if (process.platform === 'win32') {
@@ -86,7 +101,7 @@ async function main() {
   await writeFile(join(appRoot, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
 
   await cp(join(projectRoot, 'runtime', 'node'), join(unpackedRoot, 'resources', 'node'), { recursive: true })
-  await cp(join(projectRoot, 'runtime', 'harness'), join(unpackedRoot, 'resources', 'harness'), { recursive: true })
+  await cp(harnessRuntimeRoot, join(unpackedRoot, 'resources', 'harness'), { recursive: true })
   await cp(join(projectRoot, 'runtime', 'updater'), join(unpackedRoot, 'resources', 'updater'), { recursive: true })
   await verifyPackagedHarness(unpackedRoot)
 
