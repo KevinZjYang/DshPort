@@ -1,0 +1,141 @@
+name: Release portable build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Optional upstream tag, branch, or commit to package
+        required: false
+      version:
+        description: Optional DshPort release version, for example 0.1.0-rc.5
+        required: false
+      force:
+        description: Rebuild even when the DshPort release already exists
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  detect-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.detect.outputs.should_build }}
+      upstream_ref: ${{ steps.detect.outputs.upstream_ref }}
+      upstream_version: ${{ steps.detect.outputs.upstream_version }}
+      release_tag: ${{ steps.detect.outputs.release_tag }}
+      release_title: ${{ steps.detect.outputs.release_title }}
+      upstream_url: ${{ steps.detect.outputs.upstream_url }}
+    steps:
+      - id: detect
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const upstreamOwner = 'deepseek-ai'
+            const upstreamRepo = 'deepseek-harness'
+            const forcedRef = '${{ github.event.inputs.upstream_ref }}'
+            const forcedVersion = '${{ github.event.inputs.version }}'
+            const force = '${{ github.event.inputs.force }}' === 'true'
+
+            let upstreamRef = forcedRef
+            let upstreamVersion = forcedVersion
+            let upstreamUrl = `https://github.com/${upstreamOwner}/${upstreamRepo}`
+
+            if (!upstreamRef || !upstreamVersion) {
+              try {
+                const latest = await github.rest.repos.getLatestRelease({
+                  owner: upstreamOwner,
+                  repo: upstreamRepo,
+                })
+                upstreamRef ||= latest.data.tag_name
+                upstreamVersion ||= latest.data.tag_name.replace(/^v/, '')
+                upstreamUrl = latest.data.html_url
+              } catch (error) {
+                if (error.status !== 404) throw error
+                const commits = await github.paginate(github.rest.repos.listCommits, {
+                  owner: upstreamOwner,
+                  repo: upstreamRepo,
+                  sha: 'master',
+                  per_page: 100,
+                })
+                const releaseCommit = commits.find(commit =>
+                  /^release\(dsh\):\s*([^\s]+)/i.test(commit.commit.message.split('\n')[0] || ''),
+                )
+                if (!releaseCommit) {
+                  core.setFailed('No upstream GitHub Release or release(dsh): commit was found.')
+                  return
+                }
+                const firstLine = releaseCommit.commit.message.split('\n')[0]
+                upstreamVersion ||= firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)[1]
+                upstreamRef ||= releaseCommit.sha
+                upstreamUrl = releaseCommit.html_url
+              }
+            }
+
+            const releaseTag = `v${upstreamVersion.replace(/^v/, '')}`
+            let exists = false
+            try {
+              await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: releaseTag,
+              })
+              exists = true
+            } catch (error) {
+              if (error.status !== 404) throw error
+            }
+
+            core.setOutput('should_build', String(force || !exists))
+            core.setOutput('upstream_ref', upstreamRef)
+            core.setOutput('upstream_version', upstreamVersion)
+            core.setOutput('release_tag', releaseTag)
+            core.setOutput('release_title', `DshPort ${releaseTag}`)
+            core.setOutput('upstream_url', upstreamUrl)
+
+  windows-x64:
+    needs: detect-upstream
+    if: needs.detect-upstream.outputs.should_build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.0'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: node scripts/build-runtime.mjs
+        env:
+          DSH_SOURCE_REF: ${{ needs.detect-upstream.outputs.upstream_ref }}
+      - run: node scripts/package.mjs --zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DshPort-win-x64
+          path: |
+            dist-exe/desktop/DshPort-win-x64.zip
+            dist-exe/desktop/harness-runtime.zip
+            dist-exe/desktop/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect-upstream.outputs.release_tag }}
+          name: ${{ needs.detect-upstream.outputs.release_title }}
+          prerelease: ${{ contains(needs.detect-upstream.outputs.release_tag, '-') }}
+          body: |
+            Automated DshPort portable build.
+
+            Upstream source: ${{ needs.detect-upstream.outputs.upstream_url }}
+            Upstream ref: ${{ needs.detect-upstream.outputs.upstream_ref }}
+
+            Assets:
+            - DshPort-win-x64.zip: complete portable Windows x64 package
+            - harness-runtime.zip: Harness runtime-only update package
+            - SHA256SUMS.txt: SHA-256 checksums
+          files: |
+            dist-exe/desktop/DshPort-win-x64.zip
+            dist-exe/desktop/harness-runtime.zip
+            dist-exe/desktop/SHA256SUMS.txt

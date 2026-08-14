@@ -1,0 +1,19 @@
+{
+  "name": "dshport",
+  "private": true,
+  "version": "0.1.0-rc.5",
+  "description": "DshPort portable Windows desktop shell for DeepSeek Harness",
+  "type": "module",
+  "main": "src/main.cjs",
+  "scripts": {
+    "build": "node scripts/build-runtime.mjs",
+    "package": "node scripts/package.mjs",
+    "package:portable": "node scripts/package.mjs --zip",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "electron": "^38.1.0",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.3"
+  }
+}

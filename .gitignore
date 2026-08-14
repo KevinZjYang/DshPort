@@ -1,0 +1,8 @@
+node_modules/
+runtime/
+dist-exe/
+.cache/
+pnpm-debug.log
+.DS_Store
+.idea/
+.vscode/
