@@ -208,6 +208,7 @@ async function verifyMaterializedWorkspacePackages(scopeRoot) {
 async function prepareUpdater() {
   await mkdir(updaterRoot, { recursive: true })
   await cp(join(projectRoot, 'src', 'updater.cjs'), join(updaterRoot, 'updater.cjs'))
+  await cp(join(projectRoot, 'src', 'update-progress.ps1'), join(updaterRoot, 'update-progress.ps1'))
 }
 
 await prepareSource()

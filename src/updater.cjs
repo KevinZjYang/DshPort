@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto')
 const { createWriteStream } = require('node:fs')
-const { access, cp, mkdir, mkdtemp, readFile, rename, rm } = require('node:fs/promises')
+const { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const { dirname, join } = require('node:path')
 const { pipeline } = require('node:stream/promises')
@@ -99,16 +99,51 @@ async function waitForProcessExit(pid, timeoutMs = 30000) {
   }
 }
 
+// --- update progress UI ---
+
+let progressFile = ''
+
+function updaterDir() {
+  return dirname(process.argv[1] || process.execPath)
+}
+
+function startProgressWindow(file) {
+  const script = join(updaterDir(), 'update-progress.ps1')
+  try {
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-StatusFile', file,
+      '-UpdaterPid', String(process.pid),
+    ], { detached: true, stdio: 'ignore' })
+    child.unref()
+  } catch {
+    // The progress window is best-effort; the update still proceeds without it.
+  }
+}
+
+async function reportProgress(text) {
+  if (progressFile) {
+    try { await writeFile(progressFile, text) } catch {}
+  }
+}
+
+function describeAsset(asset) {
+  return asset?.size ? `（约 ${Math.round(asset.size / 1048576)} MB）` : ''
+}
+
 async function updateHarnessRuntime(release, temp) {
   const asset = release.assets?.find(item => item.name === 'harness-runtime.zip')
   if (!asset) return false
   const archive = join(temp, asset.name)
+  await reportProgress(`正在下载更新包${describeAsset(asset)}…`)
   await download(asset.browser_download_url, archive)
+  await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
   const extractRoot = join(temp, 'harness')
   await extractZip(archive, extractRoot)
   const appRoot = dirname(executablePath)
   const harnessRoot = join(appRoot, 'resources', 'harness')
+  await reportProgress('正在替换文件…')
   await replaceDirectory(harnessRoot, await singleExtractedRoot(extractRoot))
   return true
 }
@@ -117,7 +152,9 @@ async function updateWholePortable(release, temp) {
   const asset = release.assets?.find(item => /DshPort-win-x64\.zip$/u.test(item.name) || /DeepSeekHarness-win-x64\.zip$/u.test(item.name) || /win-x64\.zip$/u.test(item.name))
   if (!asset) throw new Error('No Windows x64 portable zip in the release')
   const archive = join(temp, asset.name)
+  await reportProgress(`正在下载更新包${describeAsset(asset)}…`)
   await download(asset.browser_download_url, archive)
+  await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
   const extractRoot = join(temp, 'portable')
   await extractZip(archive, extractRoot)
@@ -125,6 +162,7 @@ async function updateWholePortable(release, temp) {
   const sourceRoot = await singleExtractedRoot(extractRoot)
   const dataPath = join(appRoot, 'data')
   const dataHold = join(temp, 'data')
+  await reportProgress('正在替换文件…')
   if (await exists(dataPath)) await rename(dataPath, dataHold)
   await replaceDirectory(appRoot, sourceRoot)
   if (await exists(dataHold)) await rename(dataHold, dataPath)
@@ -133,13 +171,20 @@ async function updateWholePortable(release, temp) {
 async function main() {
   const release = await getJson(releaseTagUrl(repository, version))
   const temp = await mkdtemp(join(tmpdir(), 'dsh-update-'))
+  progressFile = join(temp, 'progress.txt')
+  await reportProgress('准备更新…')
+  startProgressWindow(progressFile)
   await waitForProcessExit(parentPid)
   const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
   if (!updatedHarness) await updateWholePortable(release, temp)
+  await reportProgress('COMPLETE')
   spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' }).unref()
 }
 
-main().catch(error => {
+main().catch(async error => {
   console.error(error.stack || error.message)
+  if (progressFile) {
+    try { await writeFile(progressFile, `FAILED ${error.message}`) } catch {}
+  }
   process.exitCode = 1
 })
