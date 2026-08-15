@@ -21,6 +21,8 @@ let harnessProcess
 let shuttingDown = false
 let suppressHarnessExitError = false
 let activeUrl
+let pendingUrl
+let windowLoaded = false
 
 function ensureDirectories() {
   for (const path of [dataRoot, dshHome, workspace, logsRoot]) mkdirSync(path, { recursive: true })
@@ -128,7 +130,7 @@ async function restartHarness() {
   try {
     await stopHarness()
     const url = await startHarness()
-    mainWindow.webContents.send('harness-url', url)
+    sendUrlToWindow(url)
     return url
   } catch (error) {
     dialog.showErrorBox(APP_NAME, error.stack || error.message)
@@ -137,7 +139,16 @@ async function restartHarness() {
   }
 }
 
-function createWindow(url) {
+function sendUrlToWindow(url) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (windowLoaded) {
+    mainWindow.webContents.send('harness-url', url)
+  } else {
+    pendingUrl = url
+  }
+}
+
+function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -145,28 +156,48 @@ function createWindow(url) {
     minHeight: 640,
     title: APP_NAME,
     icon: iconPath,
+    show: false,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
       preload: join(__dirname, 'preload.cjs'),
     },
   })
-  mainWindow.loadFile(join(__dirname, 'shell.html'), { query: { url } })
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show()
+  })
+  // shell.html shows a loading screen; the harness URL arrives via IPC once ready.
+  mainWindow.loadFile(join(__dirname, 'shell.html'))
+  mainWindow.webContents.once('did-finish-load', () => {
+    windowLoaded = true
+    if (pendingUrl) {
+      mainWindow.webContents.send('harness-url', pendingUrl)
+      pendingUrl = undefined
+    }
+  })
   mainWindow.on('closed', () => {
     mainWindow = undefined
   })
 }
 
-function downloadJson(url) {
+function downloadJson(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    const requestRef = https.request(url, { headers: { 'User-Agent': 'DeepSeekHarnessDesktop' } }, response => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const cleanup = () => clearTimeout(timer)
+    const requestRef = https.request(url, {
+      headers: { 'User-Agent': 'DeepSeekHarnessDesktop' },
+      signal: controller.signal,
+    }, response => {
       if (response.statusCode && response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        return downloadJson(response.headers.location).then(resolve, reject)
+        cleanup()
+        return downloadJson(response.headers.location, timeoutMs).then(resolve, reject)
       }
       let body = ''
       response.setEncoding('utf8')
       response.on('data', chunk => { body += chunk })
       response.on('end', () => {
+        cleanup()
         if (response.statusCode !== 200) {
           const error = new Error(`Update server returned HTTP ${response.statusCode}`)
           error.statusCode = response.statusCode
@@ -175,7 +206,15 @@ function downloadJson(url) {
         try { resolve(JSON.parse(body)) } catch (error) { reject(error) }
       })
     })
-    requestRef.on('error', reject)
+    requestRef.on('error', error => {
+      cleanup()
+      if (error.name === 'AbortError') {
+        const timeoutError = new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
+        timeoutError.code = 'ETIMEDOUT'
+        return reject(timeoutError)
+      }
+      reject(error)
+    })
     requestRef.end()
   })
 }
@@ -337,9 +376,12 @@ function installAppMenu() {
 async function start() {
   ensureDirectories()
   installAppMenu()
-  await checkForUpdates()
-  activeUrl = await startHarness()
-  createWindow(activeUrl)
+  // Show the window (loading screen) immediately; never block startup on network calls.
+  createWindow()
+  // Update check runs in the background and must not delay harness startup.
+  checkForUpdates().catch(error => console.warn('Update check failed:', error.message))
+  const url = await startHarness()
+  sendUrlToWindow(url)
 }
 
 const gotLock = app.requestSingleInstanceLock()

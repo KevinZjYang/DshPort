@@ -30,14 +30,6 @@
         background: #f7f8fa;
       }
 
-      .brand {
-        margin-right: 8px;
-        color: #111827;
-        font-size: 13px;
-        font-weight: 600;
-        white-space: nowrap;
-      }
-
       button {
         height: 28px;
         padding: 0 10px;
@@ -64,28 +56,72 @@
         border: 0;
         background: #ffffff;
       }
+
+      .loading {
+        grid-row: 2;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        color: #9aa4b2;
+        font-size: 13px;
+      }
+
+      .loading[hidden] {
+        display: none;
+      }
+
+      .spinner {
+        width: 28px;
+        height: 28px;
+        border: 3px solid #2b303b;
+        border-top-color: #5b8def;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
     </style>
   </head>
   <body>
     <div class="toolbar">
-      <div class="brand">DshPort</div>
-      <button id="openLogs" type="button">&#25171;&#24320;&#26085;&#24535;&#30446;&#24405;</button>
-      <button id="restart" type="button">&#37325;&#21551; Harness</button>
-      <button id="updates" type="button">&#26816;&#26597;&#26356;&#26032;</button>
-      <button id="about" type="button">&#20851;&#20110;</button>
+      <button id="openLogs" type="button">打开日志目录</button>
+      <button id="restart" type="button">重启 Harness</button>
+      <button id="updates" type="button">检查更新</button>
+      <button id="about" type="button">关于</button>
     </div>
-    <iframe id="harness" title="DeepSeek Harness"></iframe>
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <div>正在启动 DeepSeek Harness…</div>
+    </div>
+    <iframe id="harness" title="DeepSeek Harness" hidden></iframe>
     <script>
       const frame = document.getElementById('harness')
-      const params = new URLSearchParams(location.search)
-      frame.src = params.get('url')
+      const loading = document.getElementById('loading')
+
+      function loadUrl(url) {
+        if (!url) return
+        frame.src = url
+        frame.hidden = false
+        loading.hidden = true
+      }
+
+      // Fallback for direct loads with ?url=; normal flow delivers the URL via IPC.
+      const initialUrl = new URLSearchParams(location.search).get('url')
+      if (initialUrl) loadUrl(initialUrl)
 
       document.getElementById('openLogs').addEventListener('click', () => {
         window.deepseekHarnessDesktop.openLogFolder()
       })
       document.getElementById('restart').addEventListener('click', async () => {
+        loading.hidden = false
+        frame.hidden = true
+        frame.src = 'about:blank'
         const url = await window.deepseekHarnessDesktop.restartHarness()
-        if (url) frame.src = url
+        if (url) loadUrl(url)
       })
       document.getElementById('updates').addEventListener('click', () => {
         window.deepseekHarnessDesktop.checkForUpdates()
@@ -94,7 +130,7 @@
         window.deepseekHarnessDesktop.showAbout()
       })
       window.deepseekHarnessDesktop.onHarnessUrl(url => {
-        frame.src = url
+        loadUrl(url)
       })
     </script>
   </body>
