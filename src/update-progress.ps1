@@ -51,10 +51,23 @@ $timer.Add_Tick({
   if (Test-Path $StatusFile) {
     $text = (Get-Content $StatusFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
     if ($text) { $status.Text = $text }
+    try {
+      if ($text -match '(d{1,3})%') {
+        $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+        $bar.Value = [Math]::Min(100, [int]$Matches[1])
+      } else {
+        $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+        $bar.MarqueeAnimationSpeed = 30
+      }
+    } catch {}
   }
   if ($text -eq 'COMPLETE') {
     $title.Text = '更新完成'
     $status.Text = '正在启动 DshPort…'
+    try {
+      $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
+      $bar.Value = 100
+    } catch {}
     $timer.Stop()
     $delayClose.Interval = 1500
     $delayClose.Start()

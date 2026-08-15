@@ -187,9 +187,9 @@ function sendUrlToWindow(url) {
   }
 }
 
-function sendStatus(text, kind = 'info') {
+function sendStatus(text, kind = 'info', percent = undefined) {
   if (!mainWindow || mainWindow.isDestroyed()) return
-  mainWindow.webContents.send('app-status', { text, kind })
+  mainWindow.webContents.send('app-status', { text, kind, percent })
 }
 
 function createWindow() {
@@ -444,7 +444,7 @@ async function startBackgroundDownload(release, component) {
         const label = pct >= 0 ? `${pct}%` : `${Math.round(received / 1048576)} MB`
         if (label !== lastProgressLabel) {
           lastProgressLabel = label
-          sendStatus(`正在下载更新 v${versionLabel}… ${label}`, 'info')
+          sendStatus(`正在下载更新 v${versionLabel}… ${label}`, 'info', pct)
         }
       })
       const ok = await verifyDownloadedChecksum(release, partial, asset.name)
@@ -465,7 +465,7 @@ async function startBackgroundDownload(release, component) {
   }
   if (!existsSync(archive)) return
   writePendingUpdate(pending)
-  sendStatus(`更新 v${versionLabel} 已下载完成`, 'ok')
+  sendStatus(`更新 v${versionLabel} 已下载完成`, 'ok', 100)
   promptInstallUpdate(pending)
 }
 

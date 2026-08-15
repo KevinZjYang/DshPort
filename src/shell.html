@@ -69,6 +69,35 @@
         color: #b45309;
       }
 
+      .progress {
+        flex: 1;
+        min-width: 120px;
+        max-width: 320px;
+        height: 6px;
+        border-radius: 3px;
+        background: #e5eaf1;
+        overflow: hidden;
+      }
+
+      .progress-fill {
+        height: 100%;
+        width: 0%;
+        background: #5b8def;
+        border-radius: 3px;
+        transition: width 0.2s ease;
+      }
+
+      .progress.indeterminate .progress-fill {
+        width: 30%;
+        animation: indeterminate 1.1s ease-in-out infinite;
+      }
+
+      @keyframes indeterminate {
+        0% { margin-left: 0; }
+        50% { margin-left: 40%; }
+        100% { margin-left: 70%; }
+      }
+
       iframe {
         width: 100%;
         height: 100%;
@@ -112,6 +141,9 @@
       <button id="updates" type="button">检查更新</button>
       <button id="dataManage" type="button">数据管理</button>
       <button id="about" type="button">关于</button>
+      <div id="progress" class="progress" hidden>
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
       <span id="status" class="status"></span>
     </div>
     <div id="loading" class="loading">
@@ -135,9 +167,24 @@
       const initialUrl = new URLSearchParams(location.search).get('url')
       if (initialUrl) loadUrl(initialUrl)
 
-      window.deepseekHarnessDesktop.onAppStatus(({ text, kind = 'info' }) => {
+      const progressEl = document.getElementById('progress')
+      const progressFill = document.getElementById('progressFill')
+
+      window.deepseekHarnessDesktop.onAppStatus(({ text, kind = 'info', percent }) => {
         statusEl.textContent = text
         statusEl.className = 'status ' + kind
+        if (typeof percent === 'number') {
+          progressEl.hidden = false
+          if (percent >= 0) {
+            progressEl.classList.remove('indeterminate')
+            progressFill.style.width = Math.min(100, percent) + '%'
+          } else {
+            progressEl.classList.add('indeterminate')
+          }
+        } else {
+          progressEl.hidden = true
+          progressEl.classList.remove('indeterminate')
+        }
       })
 
       document.getElementById('openLogs').addEventListener('click', () => {
@@ -149,6 +196,8 @@
         frame.src = 'about:blank'
         statusEl.textContent = '正在重启 Harness…'
         statusEl.className = 'status info'
+        progressEl.hidden = true
+        progressEl.classList.remove('indeterminate')
         const url = await window.deepseekHarnessDesktop.restartHarness()
         if (url) loadUrl(url)
       })

@@ -3,7 +3,6 @@ const { createWriteStream } = require('node:fs')
 const { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const { dirname, join } = require('node:path')
-const { pipeline } = require('node:stream/promises')
 const { request } = require('node:https')
 const { spawn } = require('node:child_process')
 
@@ -43,19 +42,44 @@ function updaterProxiedUrl(url) {
   return `${proxy}${url}`
 }
 
-async function download(url, path) {
+function progressLabel(received, total) {
+  const pct = total > 0 ? Math.floor((received / total) * 100) : -1
+  return pct >= 0 ? `${pct}%` : `${Math.round(received / 1048576)} MB`
+}
+
+async function downloadOnce(url, path, onProgress) {
+  const response = await Promise.race([
+    fetch(url, { redirect: 'follow' }),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), 20000)),
+  ])
+  if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`)
+  const total = Number(response.headers.get('content-length')) || 0
+  let received = 0
+  const reader = response.body.getReader()
+  const stream = createWriteStream(path)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += value.length
+      if (!stream.write(value)) await new Promise(resolve => stream.once('drain', resolve))
+      if (typeof onProgress === 'function') onProgress(received, total)
+    }
+  } catch (error) {
+    stream.destroy()
+    throw error
+  }
+  await new Promise((resolve, reject) => stream.end(error => error ? reject(error) : resolve()))
+}
+
+async function download(url, path, onProgress) {
   const attempts = [url]
   const fallback = updaterProxiedUrl(url)
   if (fallback !== url) attempts.push(fallback)
   let lastError
   for (const attempt of attempts) {
     try {
-      const response = await Promise.race([
-        fetch(attempt, { redirect: 'follow' }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), 20000)),
-      ])
-      if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`)
-      await pipeline(response.body, createWriteStream(path))
+      await downloadOnce(attempt, path, onProgress)
       return
     } catch (error) {
       lastError = error
@@ -163,8 +187,10 @@ async function updateHarnessRuntime(release, temp) {
   const asset = release.assets?.find(item => item.name === 'harness-runtime.zip')
   if (!asset) return false
   const archive = join(temp, asset.name)
-  await reportProgress(`正在下载更新包${describeAsset(asset)}…`)
-  await download(asset.browser_download_url, archive)
+  await reportProgress(`正在下载更新包${describeAsset(asset)}… 0%`)
+  await download(asset.browser_download_url, archive, (received, total) => {
+    reportProgress(`正在下载更新包${describeAsset(asset)}… ${progressLabel(received, total)}`)
+  })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
   const extractRoot = join(temp, 'harness')
@@ -180,8 +206,10 @@ async function updateWholePortable(release, temp) {
   const asset = release.assets?.find(item => /DshPort-win-x64\.zip$/u.test(item.name) || /DeepSeekHarness-win-x64\.zip$/u.test(item.name) || /win-x64\.zip$/u.test(item.name))
   if (!asset) throw new Error('No Windows x64 portable zip in the release')
   const archive = join(temp, asset.name)
-  await reportProgress(`正在下载更新包${describeAsset(asset)}…`)
-  await download(asset.browser_download_url, archive)
+  await reportProgress(`正在下载更新包${describeAsset(asset)}… 0%`)
+  await download(asset.browser_download_url, archive, (received, total) => {
+    reportProgress(`正在下载更新包${describeAsset(asset)}… ${progressLabel(received, total)}`)
+  })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
   const extractRoot = join(temp, 'portable')
