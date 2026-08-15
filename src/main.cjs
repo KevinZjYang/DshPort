@@ -509,11 +509,19 @@ function launchUpdater(tagName, component, localArchive) {
   }
   const args = [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)]
   if (localArchive) args.push(localArchive)
-  spawn(nodePath, args, {
+  // Keep the updater's output in data/logs/updater.log so install failures are diagnosable.
+  const logStream = createWriteStream(join(logsRoot, 'updater.log'), { flags: 'a' })
+  const child = spawn(nodePath, args, {
     detached: true,
     windowsHide: true,
-    stdio: 'ignore',
-  }).unref()
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  child.stdout.pipe(logStream)
+  child.stderr.pipe(logStream)
+  child.once('error', error => {
+    try { logStream.write(`\n[updater spawn error] ${error.stack || error.message}\n`) } catch {}
+  })
+  child.unref()
   app.quit()
 }
 

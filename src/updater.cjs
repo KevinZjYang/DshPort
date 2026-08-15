@@ -6,7 +6,12 @@ const { dirname, join } = require('node:path')
 const { pipeline } = require('node:stream/promises')
 const { request } = require('node:https')
 const { spawn } = require('node:child_process')
-const { releaseTagUrl } = require('./portable-paths.cjs')
+
+// Self-contained on purpose: the updater is packaged alone under resources/updater
+// and must not depend on sibling files that are not copied there.
+function releaseTagUrl(repository, tagName) {
+  return `https://api.github.com/repos/${repository}/releases/tags/${encodeURIComponent(tagName)}`
+}
 
 const [, , executablePath, version, repository, component = 'auto', parentPid, localArchive] = process.argv
 if (!executablePath || !version || !repository) process.exit(2)
