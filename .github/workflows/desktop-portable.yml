@@ -45,33 +45,88 @@ jobs:
             let upstreamUrl = `https://github.com/${upstreamOwner}/${upstreamRepo}`
 
             if (!upstreamRef) {
+              // The runtime is built from the @deepseek-ai/dsh npm package, so the npm
+              // registry is the source of truth for the upstream version. npm may publish
+              // versions (e.g. 0.1.0-rc.6) without a matching git release commit or tag.
               try {
-                const latest = await github.rest.repos.getLatestRelease({
-                  owner: upstreamOwner,
-                  repo: upstreamRepo,
-                })
-                upstreamRef = latest.data.tag_name
-                upstreamVersion = latest.data.tag_name.replace(/^v/, '')
-                upstreamUrl = latest.data.html_url
-              } catch (error) {
-                if (error.status !== 404) throw error
-                const commits = await github.paginate(github.rest.repos.listCommits, {
-                  owner: upstreamOwner,
-                  repo: upstreamRepo,
-                  sha: 'master',
-                  per_page: 100,
-                })
-                const releaseCommit = commits.find(commit =>
-                  /^release\(dsh\):\s*([^\s]+)/i.test(commit.commit.message.split('\n')[0] || ''),
-                )
-                if (!releaseCommit) {
-                  core.setFailed('No upstream GitHub Release or release(dsh): commit was found.')
-                  return
+                const response = await fetch('https://registry.npmjs.org/-/package/@deepseek-ai/dsh/dist-tags')
+                if (response.ok) {
+                  const distTags = await response.json()
+                  const latest = distTags.latest
+                  if (latest) {
+                    upstreamVersion = String(latest)
+                    upstreamUrl = `https://www.npmjs.com/package/@deepseek-ai/dsh/v/${upstreamVersion}`
+                    console.log(`Detected upstream version from npm: ${upstreamVersion}`)
+                  }
                 }
-                const firstLine = releaseCommit.commit.message.split('\n')[0]
-                upstreamVersion = firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)[1]
-                upstreamRef = releaseCommit.sha
-                upstreamUrl = releaseCommit.html_url
+              } catch (error) {
+                console.warn(`npm registry lookup failed: ${error.message}`)
+              }
+
+              // Resolve a git ref for the detected version: matching tag first.
+              if (upstreamVersion) {
+                for (const tag of [upstreamVersion, `v${upstreamVersion}`]) {
+                  try {
+                    const tagRef = await github.rest.repos.getRef({
+                      owner: upstreamOwner,
+                      repo: upstreamRepo,
+                      ref: `tags/${tag}`,
+                    })
+                    upstreamRef = tagRef.data.object.sha
+                    upstreamUrl = `https://github.com/${upstreamOwner}/${upstreamRepo}/tree/${tag}`
+                    break
+                  } catch (error) {
+                    if (error.status !== 404) throw error
+                  }
+                }
+              }
+
+              // Fall back to a GitHub Release, then a release(dsh): commit, then master.
+              if (!upstreamRef) {
+                try {
+                  const latest = await github.rest.repos.getLatestRelease({
+                    owner: upstreamOwner,
+                    repo: upstreamRepo,
+                  })
+                  upstreamRef = latest.data.tag_name
+                  upstreamVersion = upstreamVersion || latest.data.tag_name.replace(/^v/, '')
+                  upstreamUrl = latest.data.html_url
+                } catch (error) {
+                  if (error.status !== 404) throw error
+                  const commits = await github.paginate(github.rest.repos.listCommits, {
+                    owner: upstreamOwner,
+                    repo: upstreamRepo,
+                    sha: 'master',
+                    per_page: 100,
+                  })
+                  const releaseCommit = upstreamVersion
+                    ? commits.find(commit => {
+                        const firstLine = commit.commit.message.split('\n')[0] || ''
+                        const match = firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)
+                        return match && match[1] === upstreamVersion
+                      })
+                    : commits.find(commit =>
+                        /^release\(dsh\):\s*([^\s]+)/i.test(commit.commit.message.split('\n')[0] || ''),
+                      )
+                  if (releaseCommit) {
+                    const firstLine = releaseCommit.commit.message.split('\n')[0]
+                    upstreamVersion = upstreamVersion || firstLine.match(/^release\(dsh\):\s*([^\s]+)/i)[1]
+                    upstreamRef = releaseCommit.sha
+                    upstreamUrl = releaseCommit.html_url
+                  } else if (!upstreamVersion) {
+                    core.setFailed('No upstream GitHub Release or release(dsh): commit was found.')
+                    return
+                  } else {
+                    // No tag or release commit matches the npm version; pin to master HEAD.
+                    const head = await github.rest.repos.getCommit({
+                      owner: upstreamOwner,
+                      repo: upstreamRepo,
+                      ref: 'master',
+                    })
+                    upstreamRef = head.data.sha
+                    upstreamUrl = head.data.html_url
+                  }
+                }
               }
             }
 
