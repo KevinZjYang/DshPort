@@ -219,6 +219,21 @@ function downloadJson(url, timeoutMs = 10000) {
   })
 }
 
+function compareVersionsSafe(left, right) {
+  try { return compareVersions(left, right) > 0 } catch { return false }
+}
+
+function parseReleaseHarnessVersion(release) {
+  const match = /上游版本：([0-9][^\s\r\n]*)/u.exec(release.body || '')
+  return match ? match[1].trim() : undefined
+}
+
+function sizeOf(release, kind) {
+  const pattern = kind === 'harness' ? /harness-runtime\.zip$/u : /DshPort-win-x64\.zip$/u
+  const asset = release.assets?.find(item => pattern.test(item.name))
+  return asset?.size ? `（约 ${Math.round(asset.size / 1048576)} MB）` : ''
+}
+
 async function checkForUpdates({ manual = false } = {}) {
   if (UPDATE_REPOSITORY === '') {
     if (manual) await checkSourceVersion()
@@ -236,7 +251,11 @@ async function checkForUpdates({ manual = false } = {}) {
   try {
     const release = await downloadJson(`https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`)
     const latest = String(release.tag_name || '').replace(/^v/u, '')
-    if (!latest || latest === localVersion) {
+    const harnessLatest = parseReleaseHarnessVersion(release)
+    const harnessLocal = getHarnessVersion()
+    const shellOutdated = latest !== '' && latest !== localVersion && compareVersionsSafe(latest, localVersion)
+    const harnessOutdated = harnessLatest !== undefined && harnessLatest !== harnessLocal && compareVersionsSafe(harnessLatest, harnessLocal)
+    if (!shellOutdated && !harnessOutdated) {
       if (manual) {
         await dialog.showMessageBox({
           type: 'info',
@@ -247,24 +266,55 @@ async function checkForUpdates({ manual = false } = {}) {
       }
       return
     }
+
+    let message
+    let detail
+    let buttons
+    let component = 'portable'
+    if (shellOutdated && harnessOutdated) {
+      message = `发现新版本：DshPort ${latest} / Harness ${harnessLatest}`
+      detail = [
+        `DshPort 版本：${localVersion} → ${latest}`,
+        `Harness 版本：${harnessLocal} → ${harnessLatest}`,
+        '',
+        `完整更新${sizeOf(release, 'portable')}；或仅更新 Harness 运行时${sizeOf(release, 'harness')}。`,
+        'data/ 下的数据会保留。',
+      ].join('\n')
+      buttons = ['完整更新', '仅更新 Harness 运行时', '跳过']
+    } else if (shellOutdated) {
+      message = `发现新版本：DshPort ${latest}`
+      detail = [
+        `DshPort 版本：${localVersion} → ${latest}`,
+        `Harness 版本：${harnessLocal}（已最新）`,
+        '',
+        `替换完整便携应用${sizeOf(release, 'portable')}。`,
+        'data/ 下的数据会保留。',
+      ].join('\n')
+      buttons = ['更新', '跳过']
+    } else {
+      message = `发现新的 Harness 版本：${harnessLatest}`
+      component = 'harness'
+      detail = [
+        `DshPort 版本：${localVersion}（已最新）`,
+        `Harness 版本：${harnessLocal} → ${harnessLatest}`,
+        '',
+        `仅替换 Harness 运行时${sizeOf(release, 'harness')}，外壳文件不变。`,
+        'data/ 下的数据会保留。',
+      ].join('\n')
+      buttons = ['更新', '跳过']
+    }
+
     const answer = await dialog.showMessageBox({
       type: 'info',
       title: APP_NAME,
-      message: `New version available: ${latest}`,
-      detail: [
-        `Current version: ${localVersion}`,
-        `Latest version: ${latest}`,
-        '',
-        release.assets?.some(asset => asset.name === 'harness-runtime.zip')
-          ? 'This update can replace only the bundled Harness runtime.'
-          : 'This update will replace the portable application files.',
-        'User data under data/ will be preserved.',
-      ].join('\n'),
-      buttons: ['Update', 'Skip'],
+      message,
+      detail,
+      buttons,
       defaultId: 0,
-      cancelId: 1,
+      cancelId: buttons.length - 1,
     })
-    if (answer.response === 0) launchUpdater(release)
+    if (answer.response === 0) launchUpdater(release, component)
+    else if (buttons.length === 3 && answer.response === 1) launchUpdater(release, 'harness')
   } catch (error) {
     console.warn('Update check failed:', error.message)
     if (error.statusCode === 404) {
@@ -338,7 +388,7 @@ async function checkSourceVersion() {
   }
 }
 
-function launchUpdater(release) {
+function launchUpdater(release, component) {
   const updater = join(runtimeRoot, 'updater', 'updater.cjs')
   const nodePath = join(runtimeRoot, 'node', process.platform === 'win32' ? 'node.exe' : 'node')
   if (!existsSync(updater)) {
@@ -346,7 +396,9 @@ function launchUpdater(release) {
     return
   }
   const tagName = String(release.tag_name)
-  const component = release.assets?.some(asset => /DshPort-win-x64\.zip$/u.test(asset.name)) ? 'portable' : 'harness'
+  if (!component) {
+    component = release.assets?.some(asset => /DshPort-win-x64\.zip$/u.test(asset.name)) ? 'portable' : 'harness'
+  }
   spawn(nodePath, [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)], {
     detached: true,
     windowsHide: true,
