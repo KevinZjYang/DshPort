@@ -290,14 +290,14 @@ function sha256Of(file) {
   })
 }
 
-async function verifyDownloadedChecksum(release, archive) {
+async function verifyDownloadedChecksum(release, archive, expectedName = basename(archive)) {
   const checksumAsset = release.assets?.find(item => item.name === 'SHA256SUMS.txt')
   if (!checksumAsset) return true
   try {
     const target = join(updatesDir, 'SHA256SUMS.txt')
     await downloadFile(checksumAsset.browser_download_url, target)
     const text = readFileSync(target, 'utf8')
-    const expected = text.split(/\r?\n/u).find(line => line.includes(basename(archive)))?.split(/\s+/u)[0]
+    const expected = text.split(/\r?\n/u).find(line => line.includes(expectedName))?.split(/\s+/u)[0]
     if (!expected) return false
     return expected.toLowerCase() === (await sha256Of(archive)).toLowerCase()
   } catch {
@@ -317,7 +317,7 @@ async function startBackgroundDownload(release, component) {
       const partial = `${archive}.part`
       rmSync(partial, { force: true })
       await downloadFile(asset.browser_download_url, partial)
-      const ok = await verifyDownloadedChecksum(release, partial)
+      const ok = await verifyDownloadedChecksum(release, partial, asset.name)
       if (!ok) {
         rmSync(partial, { force: true })
         throw new Error('Checksum verification failed')
