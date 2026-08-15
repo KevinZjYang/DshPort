@@ -67,7 +67,7 @@ jobs:
               if (upstreamVersion) {
                 for (const tag of [upstreamVersion, `v${upstreamVersion}`]) {
                   try {
-                    const tagRef = await github.rest.repos.getRef({
+                    const tagRef = await github.rest.git.getRef({
                       owner: upstreamOwner,
                       repo: upstreamRepo,
                       ref: `tags/${tag}`,
