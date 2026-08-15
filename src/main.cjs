@@ -1,9 +1,10 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHash } = require('node:crypto')
 const { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
+const { tmpdir } = require('node:os')
 const { basename, dirname, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
 
@@ -11,22 +12,42 @@ const APP_NAME = 'DshPort'
 const DEFAULT_PORT = 3080
 const UPDATE_REPOSITORY = process.env.DSH_UPDATE_REPOSITORY || 'KevinZjYang/DshPort'
 const SOURCE_REPOSITORY = process.env.DSH_SOURCE_REPOSITORY || 'deepseek-ai/deepseek-harness'
+// GitHub 下载代理：直连失败时自动把下载地址拼在代理域名后面重试（默认 gh.yiun.cyou）。
+function resolveUpdateProxy() {
+  const raw = process.env.DSH_UPDATE_PROXY
+  if (raw === '0' || raw === 'off' || raw === 'false') return ''
+  return raw || 'https://gh.yiun.cyou/'
+}
+const UPDATE_PROXY = resolveUpdateProxy()
+
+function proxiedUrl(url) {
+  if (!UPDATE_PROXY) return url
+  if (url.startsWith(UPDATE_PROXY)) return url
+  if (!/^https?:\/\//u.test(url)) return url
+  return `${UPDATE_PROXY}${url}`
+}
 const isPackaged = app.isPackaged
 const runtimeRoot = isPackaged ? process.resourcesPath : join(__dirname, '..', 'runtime')
 const portableRoot = isPackaged ? dirname(process.execPath) : join(__dirname, '..', '..')
 const { dataRoot, dshHome, workspace, logsRoot } = portableDataPaths(portableRoot)
 const iconPath = join(__dirname, '..', 'resources', 'icon.ico')
+const trayIconPath = join(__dirname, '..', 'resources', 'icon.png')
 const updatesDir = join(dataRoot, 'updates')
+const settingsFile = join(dataRoot, 'settings.json')
 
 let mainWindow
 let harnessProcess
+let tray = null
 let shuttingDown = false
+let quitting = false
 let suppressHarnessExitError = false
+let restoreInProgress = false
 let activeUrl
 let pendingUrl
 let windowLoaded = false
 let backgroundDownload = null
 let installPromptOpen = false
+let lastProgressLabel = ''
 
 function ensureDirectories() {
   for (const path of [dataRoot, dshHome, workspace, logsRoot, updatesDir]) mkdirSync(path, { recursive: true })
@@ -69,7 +90,7 @@ function waitForUrl(url, timeoutMs = 60000) {
   const transport = url.startsWith('https:') ? https : http
   return new Promise((resolve, reject) => {
     const retry = () => {
-      if (Date.now() - started > timeoutMs) return reject(new Error(`Harness did not become ready within ${timeoutMs}ms`))
+      if (Date.now() - started > timeoutMs) return reject(new Error(`Harness 未在 ${timeoutMs}ms 内启动完成`))
       setTimeout(poll, 250)
     }
     const poll = () => {
@@ -113,11 +134,19 @@ function spawnHarness(port) {
   harnessProcess = child
   child.stdout.pipe(logStream)
   child.stderr.pipe(logStream)
+  child.once('error', error => {
+    logStream.end()
+    if (harnessProcess === child) harnessProcess = undefined
+    if (!shuttingDown && !suppressHarnessExitError && mainWindow && !mainWindow.isDestroyed()) {
+      dialog.showErrorBox(APP_NAME, `无法启动 Harness：${error.message}\n日志：${logPath}`)
+      app.quit()
+    }
+  })
   child.once('exit', (code, signal) => {
     logStream.end()
     if (harnessProcess === child) harnessProcess = undefined
     if (!shuttingDown && !suppressHarnessExitError && mainWindow && !mainWindow.isDestroyed()) {
-      dialog.showErrorBox(APP_NAME, `Harness exited (code=${code ?? 'null'}, signal=${signal ?? 'none'}). Logs: ${logPath}`)
+      dialog.showErrorBox(APP_NAME, `Harness 进程已退出（code=${code ?? 'null'}，signal=${signal ?? 'none'}）。\n日志：${logPath}`)
       app.quit()
     }
   })
@@ -158,6 +187,11 @@ function sendUrlToWindow(url) {
   }
 }
 
+function sendStatus(text, kind = 'info') {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('app-status', { text, kind })
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -185,6 +219,22 @@ function createWindow() {
       pendingUrl = undefined
     }
   })
+  // 关闭窗口时最小化到托盘，应用与 Harness 继续在后台运行。
+  mainWindow.on('close', event => {
+    if (!quitting && tray) {
+      event.preventDefault()
+      mainWindow.hide()
+      if (process.platform === 'win32') {
+        try {
+          tray.displayBalloon({
+            iconType: 'info',
+            title: APP_NAME,
+            content: 'DshPort 仍在后台运行。点击托盘图标恢复窗口，右键图标可退出。',
+          })
+        } catch {}
+      }
+    }
+  })
   mainWindow.on('closed', () => {
     mainWindow = undefined
   })
@@ -209,7 +259,7 @@ function downloadJson(url, timeoutMs = 10000) {
       response.on('end', () => {
         cleanup()
         if (response.statusCode !== 200) {
-          const error = new Error(`Update server returned HTTP ${response.statusCode}`)
+          const error = new Error(`更新服务器返回 HTTP ${response.statusCode}`)
           error.statusCode = response.statusCode
           return reject(error)
         }
@@ -219,7 +269,7 @@ function downloadJson(url, timeoutMs = 10000) {
     requestRef.on('error', error => {
       cleanup()
       if (error.name === 'AbortError') {
-        const timeoutError = new Error(`Request timed out after ${timeoutMs}ms: ${url}`)
+        const timeoutError = new Error(`请求超时：${url}`)
         timeoutError.code = 'ETIMEDOUT'
         return reject(timeoutError)
       }
@@ -258,28 +308,99 @@ function discardPendingUpdate() {
   try { rmSync(join(updatesDir, 'pending.json'), { force: true }) } catch {}
 }
 
-async function downloadFile(url, target, onProgress) {
-  const response = await fetch(url, { redirect: 'follow' })
-  if (!response.ok || !response.body) throw new Error(`Download failed: HTTP ${response.status}`)
+function readSettings() {
+  try {
+    if (!existsSync(settingsFile)) return {}
+    return JSON.parse(readFileSync(settingsFile, 'utf8')) || {}
+  } catch {
+    return {}
+  }
+}
+
+function writeSettings(settings) {
+  mkdirSync(dataRoot, { recursive: true })
+  writeFileSync(settingsFile, JSON.stringify(settings, null, 2))
+}
+
+function normalizeTag(tag) {
+  return String(tag || '').replace(/^v/u, '')
+}
+
+function isIgnoredVersion(tag) {
+  const normalized = normalizeTag(tag)
+  if (normalized === '') return false
+  return (readSettings().ignoredUpdateVersions || []).includes(normalized)
+}
+
+function addIgnoredVersion(tag) {
+  const normalized = normalizeTag(tag)
+  if (normalized === '') return
+  const settings = readSettings()
+  const ignored = new Set(settings.ignoredUpdateVersions || [])
+  ignored.add(normalized)
+  settings.ignoredUpdateVersions = [...ignored].sort()
+  writeSettings(settings)
+}
+
+async function downloadFileOnce(url, target, onProgress, connectTimeoutMs = 20000, idleTimeoutMs = 30000) {
+  const controller = new AbortController()
+  const connectTimer = setTimeout(() => controller.abort(), connectTimeoutMs)
+  let response
+  try {
+    response = await fetch(url, { redirect: 'follow', signal: controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`连接超时：${url}`)
+    throw error
+  } finally {
+    clearTimeout(connectTimer)
+  }
+  if (!response.ok || !response.body) throw new Error(`下载失败：HTTP ${response.status}`)
   const total = Number(response.headers.get('content-length')) || 0
   let received = 0
   const reader = response.body.getReader()
   const stream = createWriteStream(target)
+  let idleTimer
+  const armIdle = () => {
+    clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => controller.abort(), idleTimeoutMs)
+  }
   try {
+    armIdle()
     for (;;) {
       const { done, value } = await reader.read()
       if (done) break
       received += value.length
+      armIdle()
       if (!stream.write(value)) await new Promise(resolve => stream.once('drain', resolve))
       if (typeof onProgress === 'function') onProgress(received, total)
     }
   } catch (error) {
     stream.destroy()
+    if (controller.signal.aborted) throw new Error(`下载超时（${Math.round(idleTimeoutMs / 1000)} 秒无数据）：${url}`)
     throw error
+  } finally {
+    clearTimeout(idleTimer)
   }
   await new Promise((resolve, reject) => stream.end(error => error ? reject(error) : resolve()))
 }
 
+// 直连失败时自动改用代理重试一次（如 https://gh.yiun.cyou/<原始下载地址>）。
+async function downloadFile(url, target, onProgress) {
+  const attempts = [url]
+  const fallback = proxiedUrl(url)
+  if (fallback !== url) attempts.push(fallback)
+  let lastError
+  for (const attempt of attempts) {
+    try {
+      await downloadFileOnce(attempt, target, onProgress)
+      return
+    } catch (error) {
+      lastError = error
+      console.warn('Download failed, trying next source:', attempt, '->', error.message)
+    }
+  }
+  throw lastError
+}
 function sha256Of(file) {
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256')
@@ -311,16 +432,25 @@ async function startBackgroundDownload(release, component) {
   if (!asset) return
   const archive = join(updatesDir, asset.name)
   const pending = { tag: String(release.tag_name || ''), component, archive }
+  const versionLabel = normalizeTag(release.tag_name)
   if (!existsSync(archive)) {
     if (backgroundDownload) return
     backgroundDownload = (async () => {
       const partial = `${archive}.part`
       rmSync(partial, { force: true })
-      await downloadFile(asset.browser_download_url, partial)
+      lastProgressLabel = ''
+      await downloadFile(asset.browser_download_url, partial, (received, total) => {
+        const pct = total > 0 ? Math.floor((received / total) * 100) : -1
+        const label = pct >= 0 ? `${pct}%` : `${Math.round(received / 1048576)} MB`
+        if (label !== lastProgressLabel) {
+          lastProgressLabel = label
+          sendStatus(`正在下载更新 v${versionLabel}… ${label}`, 'info')
+        }
+      })
       const ok = await verifyDownloadedChecksum(release, partial, asset.name)
       if (!ok) {
         rmSync(partial, { force: true })
-        throw new Error('Checksum verification failed')
+        throw new Error('校验和验证失败')
       }
       rmSync(archive, { force: true })
       renameSync(partial, archive)
@@ -330,10 +460,12 @@ async function startBackgroundDownload(release, component) {
     await backgroundDownload
   } catch (error) {
     console.warn('Background update download failed:', error.message)
+    sendStatus(`更新下载失败：${error.message}`, 'warn')
     return
   }
   if (!existsSync(archive)) return
   writePendingUpdate(pending)
+  sendStatus(`更新 v${versionLabel} 已下载完成`, 'ok')
   promptInstallUpdate(pending)
 }
 
@@ -342,26 +474,67 @@ async function promptInstallUpdate(pending) {
   installPromptOpen = true
   try {
     const size = existsSync(pending.archive) ? Math.round(statSync(pending.archive).size / 1048576) : 0
-    const versionLabel = String(pending.tag || '').replace(/^v/u, '')
+    const versionLabel = normalizeTag(pending.tag)
     const answer = await dialog.showMessageBox({
       type: 'info',
       title: APP_NAME,
       message: pending.component === 'harness'
         ? `Harness 更新已下载完成（约 ${size} MB）`
-        : `DshPort ${versionLabel} 更新已下载完成（约 ${size} MB）`,
+        : `DshPort v${versionLabel} 更新已下载完成（约 ${size} MB）`,
       detail: [
         '更新包已在后台下载完成，可以随时安装。',
         '安装时应用会短暂关闭，完成后自动重新启动。',
         'data/ 下的数据会保留。',
+        '',
+        '“稍后”将在 24 小时后再次提醒；“忽略此版本”将不再提示该版本。',
       ].join('\n'),
-      buttons: ['立即安装', '稍后'],
+      buttons: ['立即安装', '稍后（24 小时后提醒）', '忽略此版本'],
       defaultId: 0,
       cancelId: 1,
     })
-    if (answer.response === 0) launchUpdater(pending.tag, pending.component, pending.archive)
+    if (answer.response === 0) {
+      sendStatus('正在安装更新…', 'info')
+      launchUpdater(pending.tag, pending.component, pending.archive)
+    } else if (answer.response === 1) {
+      pending.remindAfter = Date.now() + 24 * 60 * 60 * 1000
+      writePendingUpdate(pending)
+      sendStatus(`更新 v${versionLabel} 已推迟，24 小时后再次提醒`, 'info')
+    } else if (answer.response === 2) {
+      addIgnoredVersion(pending.tag)
+      discardPendingUpdate()
+      sendStatus(`已忽略版本 v${versionLabel}`, 'info')
+    }
   } finally {
     installPromptOpen = false
   }
+}
+
+async function confirmDownload(release, component) {
+  const asset = release.assets?.find(item =>
+    component === 'harness' ? item.name === 'harness-runtime.zip' : /DshPort-win-x64\.zip$/u.test(item.name))
+  const size = asset?.size ? `（约 ${Math.round(asset.size / 1048576)} MB）` : ''
+  const versionLabel = normalizeTag(release.tag_name)
+  const answer = await dialog.showMessageBox({
+    type: 'info',
+    title: APP_NAME,
+    message: component === 'harness'
+      ? `发现新的 Harness 版本${size}，是否下载？`
+      : `发现新版本 DshPort v${versionLabel}${size}，是否下载？`,
+    detail: [
+      '更新包将在后台下载，下载完成后会提示安装。',
+      '安装时应用会短暂关闭，完成后自动重新启动。',
+      'data/ 下的数据会保留。',
+    ].join('\n'),
+    buttons: ['下载', '忽略此版本', '取消'],
+    defaultId: 0,
+    cancelId: 2,
+  })
+  if (answer.response === 1) {
+    addIgnoredVersion(release.tag_name)
+    sendStatus(`已忽略版本 v${versionLabel}`, 'info')
+    return 'ignore'
+  }
+  return answer.response === 0 ? 'download' : 'cancel'
 }
 
 async function checkForUpdates({ manual = false } = {}) {
@@ -370,17 +543,18 @@ async function checkForUpdates({ manual = false } = {}) {
     return
   }
   if (process.env.DSH_DISABLE_UPDATE_CHECK === '1') {
-    if (manual) await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: 'Update checks are disabled.' })
+    if (manual) await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '更新检查已被禁用（设置了 DSH_DISABLE_UPDATE_CHECK=1）。' })
     return
   }
   if (!isPackaged) {
-    if (manual) await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: 'Update checks are only available in the packaged app.' })
+    if (manual) await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '更新检查仅在打包版（便携版）应用中可用。' })
     return
   }
-  const localVersion = getVersion().replace(/^v/u, '')
+  const localVersion = normalizeTag(getVersion())
   try {
+    sendStatus('正在检查更新…', 'info')
     const release = await downloadJson(`https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`)
-    const latest = String(release.tag_name || '').replace(/^v/u, '')
+    const latest = normalizeTag(release.tag_name)
     const harnessLatest = parseReleaseHarnessVersion(release)
     const harnessLocal = getHarnessVersion()
     const shellOutdated = latest !== '' && latest !== localVersion && compareVersionsSafe(latest, localVersion)
@@ -389,8 +563,18 @@ async function checkForUpdates({ manual = false } = {}) {
     // A previously downloaded update may still be waiting to be installed.
     const pending = readPendingUpdate()
     if (pending) {
-      const pendingTag = String(pending.tag || '').replace(/^v/u, '')
+      const pendingTag = normalizeTag(pending.tag)
       if (pendingTag !== '' && pendingTag === latest && pendingTag !== localVersion) {
+        if (isIgnoredVersion(pendingTag)) {
+          discardPendingUpdate()
+          sendStatus(`已忽略版本 v${pendingTag}`, 'info')
+          return
+        }
+        // “稍后”提醒：非手动检查且未到提醒时间时不再打扰。
+        if (!manual && pending.remindAfter && Date.now() < pending.remindAfter) {
+          sendStatus(`更新 v${pendingTag} 已下载，稍后将再次提醒安装`, 'info')
+          return
+        }
         promptInstallUpdate(pending)
         return
       }
@@ -398,12 +582,26 @@ async function checkForUpdates({ manual = false } = {}) {
     }
 
     if (!shellOutdated && !harnessOutdated) {
+      sendStatus(`已是最新版本（v${localVersion}）`, 'ok')
       if (manual) {
         await dialog.showMessageBox({
           type: 'info',
           title: APP_NAME,
-          message: 'You are already on the latest version.',
-          detail: `Current version: ${localVersion}`,
+          message: '当前已是最新版本。',
+          detail: `当前版本：v${localVersion}`,
+        })
+      }
+      return
+    }
+
+    const outdatedTag = shellOutdated ? latest : harnessLatest
+    if (isIgnoredVersion(outdatedTag)) {
+      sendStatus(`已忽略版本 v${normalizeTag(outdatedTag)}`, 'info')
+      if (manual) {
+        await dialog.showMessageBox({
+          type: 'info',
+          title: APP_NAME,
+          message: `版本 v${normalizeTag(outdatedTag)} 已被忽略，不再提示下载。`,
         })
       }
       return
@@ -416,16 +614,20 @@ async function checkForUpdates({ manual = false } = {}) {
           title: APP_NAME,
           message: '更新正在后台下载中，完成后会提示安装。',
         })
+      } else {
+        sendStatus('更新正在后台下载中…', 'info')
       }
       return
     }
 
-    // Download in the background first; the user installs only after it is ready.
+    // 下载前先确认：大更新包不应在用户不知情时静默下载。
+    const decision = await confirmDownload(release, shellOutdated ? 'portable' : 'harness')
+    if (decision !== 'download') return
     await startBackgroundDownload(release, shellOutdated ? 'portable' : 'harness')
   } catch (error) {
     console.warn('Update check failed:', error.message)
     const pending = readPendingUpdate()
-    if (pending) {
+    if (pending && (!pending.remindAfter || Date.now() >= pending.remindAfter)) {
       promptInstallUpdate(pending)
       return
     }
@@ -434,18 +636,23 @@ async function checkForUpdates({ manual = false } = {}) {
         await dialog.showMessageBox({
           type: 'info',
           title: APP_NAME,
-          message: '\u5f53\u524d\u6682\u65e0\u53ef\u7528\u66f4\u65b0\u3002',
-        detail: `Update source has no published release yet: ${UPDATE_REPOSITORY}`,
+          message: '当前暂无可用更新。',
+          detail: `更新源尚无已发布版本：${UPDATE_REPOSITORY}`,
         })
       }
       return
     }
+    sendStatus('检查更新失败', 'warn')
     if (manual) {
       await dialog.showMessageBox({
         type: 'warning',
         title: APP_NAME,
-        message: 'Update check failed.',
-        detail: error.message,
+        message: '检查更新失败。',
+        detail: [
+          error.message,
+          '',
+          '提示：更新包下载时若直连 GitHub 失败，会自动改用代理 https://gh.yiun.cyou/；可用环境变量 DSH_UPDATE_PROXY 自定义（设为 0 或 off 可禁用）。',
+        ].join('\n'),
       })
     }
   }
@@ -462,7 +669,7 @@ async function checkSourceVersion() {
         type: 'info',
         title: APP_NAME,
         message: '\u672a\u627e\u5230\u4e0a\u6e38\u7248\u672c\u66f4\u65b0\u63d0\u4ea4\u3002',
-        detail: `Checked commits from ${SOURCE_REPOSITORY}.`,
+        detail: `已检查 ${SOURCE_REPOSITORY} 的提交记录。`,
       })
       return
     }
@@ -471,7 +678,7 @@ async function checkSourceVersion() {
         type: 'info',
         title: APP_NAME,
         message: '\u5f53\u524d\u5df2\u662f\u6700\u65b0\u6e90\u7801\u7248\u672c\u3002',
-        detail: `Current version: ${localVersion}\nLatest source version: ${latest}`,
+        detail: `当前版本：${localVersion}\n上游最新源码版本：${latest}`,
       })
       return
     }
@@ -480,12 +687,12 @@ async function checkSourceVersion() {
       title: APP_NAME,
       message: `\u53d1\u73b0\u4e0a\u6e38\u65b0\u7248\u672c\uff1a${latest}`,
       detail: [
-        `Current version: ${localVersion}`,
-        `Latest source version: ${latest}`,
+        `当前版本：${localVersion}`,
+        `上游最新源码版本：${latest}`,
         '',
-        'The upstream repository does not provide a portable Windows package here. Configure DSH_UPDATE_REPOSITORY to a DshPort package release repository to update automatically.',
+        '上游仓库本身不提供 Windows 便携包。如需自动更新，请将 DSH_UPDATE_REPOSITORY 配置为 DshPort 的发布仓库。',
       ].join('\n'),
-      buttons: ['OK', 'Open Commit'],
+      buttons: ['确定', '打开提交'],
       defaultId: 0,
       cancelId: 0,
     })
@@ -504,7 +711,7 @@ function launchUpdater(tagName, component, localArchive) {
   const updater = join(runtimeRoot, 'updater', 'updater.cjs')
   const nodePath = join(runtimeRoot, 'node', process.platform === 'win32' ? 'node.exe' : 'node')
   if (!existsSync(updater)) {
-    dialog.showErrorBox(APP_NAME, `Updater not found: ${updater}`)
+    dialog.showErrorBox(APP_NAME, `未找到更新程序：${updater}`)
     return
   }
   const args = [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)]
@@ -526,21 +733,196 @@ function launchUpdater(tagName, component, localArchive) {
 }
 
 async function showAbout() {
-  await dialog.showMessageBox({
+  const answer = await dialog.showMessageBox({
     type: 'info',
-    title: `About ${APP_NAME}`,
+    title: `关于 ${APP_NAME}`,
     message: APP_NAME,
     detail: [
-      `Desktop version: ${getVersion()}`,
-      `Harness version: ${getHarnessVersion()}`,
-      `Data: ${dataRoot}`,
-      `Logs: ${logsRoot}`,
+      `桌面版本：v${normalizeTag(getVersion())}`,
+      `Harness 版本：${getHarnessVersion()}`,
+      `数据目录：${dataRoot}`,
+      `日志目录：${logsRoot}`,
     ].join('\n'),
+    buttons: ['打开数据目录', '打开日志目录', '确定'],
+    defaultId: 2,
+    cancelId: 2,
   })
+  if (answer.response === 0) shell.openPath(dataRoot)
+  else if (answer.response === 1) shell.openPath(logsRoot)
 }
 
 function installAppMenu() {
   Menu.setApplicationMenu(null)
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function quitApp() {
+  if (quitting) return
+  dialog.showMessageBox({
+    type: 'question',
+    title: APP_NAME,
+    message: '确定退出 DshPort？',
+    detail: '退出后 Harness 将停止运行；会话与数据会保存在 data/ 目录中。',
+    buttons: ['取消', '退出'],
+    defaultId: 0,
+    cancelId: 0,
+  }).then(answer => {
+    if (answer.response !== 1) return
+    quitting = true
+    app.quit()
+  })
+}
+
+function createTray() {
+  if (tray) return
+  const trayIcon = existsSync(trayIconPath) ? trayIconPath : iconPath
+  tray = new Tray(trayIcon)
+  tray.setToolTip(APP_NAME)
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: '显示主窗口', click: showMainWindow },
+    { type: 'separator' },
+    { label: '重启 Harness', click: () => restartHarness() },
+    { label: '检查更新', click: () => checkForUpdates({ manual: true }) },
+    { label: '备份数据', click: () => backupData() },
+    { label: '恢复备份', click: () => restoreData() },
+    { type: 'separator' },
+    { label: '打开数据目录', click: () => shell.openPath(dataRoot) },
+    { label: '打开日志目录', click: () => shell.openPath(logsRoot) },
+    { type: 'separator' },
+    { label: '退出', click: quitApp },
+  ]))
+  tray.on('double-click', showMainWindow)
+}
+
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    let stderr = ''
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.once('error', reject)
+    child.once('exit', code => {
+      if (code === 0) return resolve()
+      reject(new Error(`${command} ${args.join(' ')} 执行失败（exit ${code}）：${stderr.trim().slice(0, 300)}`))
+    })
+  })
+}
+
+// Windows 10 1803+ 自带 bsdtar，项目打包流程已依赖 tar 生成 zip。
+async function createDataBackup(targetZip) {
+  await runCommand('tar.exe', ['-a', '-cf', targetZip, '--exclude=updates', '-C', dataRoot, '.'])
+}
+
+async function backupData() {
+  const stamp = new Date().toISOString().replace(/[:.]/gu, '-').slice(0, 19).replace('T', '-')
+  const result = await dialog.showSaveDialog({
+    title: '备份数据',
+    defaultPath: join(app.getPath('downloads'), `DshPort-数据备份-${stamp}.zip`),
+    filters: [{ name: 'ZIP 压缩包', extensions: ['zip'] }],
+  })
+  if (result.canceled || !result.filePath) return
+  const target = result.filePath
+  sendStatus('正在备份数据…', 'info')
+  try {
+    await createDataBackup(target)
+    sendStatus('数据备份完成', 'ok')
+    const answer = await dialog.showMessageBox({
+      type: 'info',
+      title: APP_NAME,
+      message: '数据备份完成。',
+      detail: target,
+      buttons: ['打开所在文件夹', '确定'],
+      defaultId: 1,
+      cancelId: 1,
+    })
+    if (answer.response === 0) shell.openPath(dirname(target))
+  } catch (error) {
+    console.warn('Data backup failed:', error.message)
+    sendStatus('数据备份失败', 'warn')
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: '数据备份失败。',
+      detail: error.message,
+    })
+  }
+}
+
+async function restoreData() {
+  if (restoreInProgress) return
+  const result = await dialog.showOpenDialog({
+    title: '恢复数据备份',
+    properties: ['openFile'],
+    filters: [{ name: 'ZIP 压缩包', extensions: ['zip'] }],
+  })
+  if (result.canceled || result.filePaths.length === 0) return
+  const archive = result.filePaths[0]
+  const answer = await dialog.showMessageBox({
+    type: 'warning',
+    title: APP_NAME,
+    message: '恢复备份将覆盖当前 data/ 中的会话、配置和工作区数据。',
+    detail: [
+      '恢复期间 Harness 会短暂停止，完成后自动重启。',
+      `备份文件：${archive}`,
+    ].join('\n'),
+    buttons: ['取消', '继续恢复'],
+    defaultId: 0,
+    cancelId: 0,
+  })
+  if (answer.response !== 1) return
+  restoreInProgress = true
+  suppressHarnessExitError = true
+  sendStatus('正在恢复数据备份…', 'info')
+  const backupDir = `${dataRoot}.backup-${Date.now()}`
+  try {
+    await stopHarness()
+    // 给杀毒软件/文件系统一点时间释放句柄。
+    await new Promise(resolve => setTimeout(resolve, 300))
+    if (existsSync(dataRoot)) renameSync(dataRoot, backupDir)
+    mkdirSync(dataRoot, { recursive: true })
+    try {
+      await runCommand('tar.exe', ['-xf', archive, '-C', dataRoot])
+    } catch (extractError) {
+      rmSync(dataRoot, { recursive: true, force: true })
+      if (existsSync(backupDir)) renameSync(backupDir, dataRoot)
+      throw extractError
+    }
+    rmSync(backupDir, { recursive: true, force: true })
+    ensureDirectories()
+    const url = await startHarness()
+    sendUrlToWindow(url)
+    sendStatus('数据备份恢复完成', 'ok')
+    await dialog.showMessageBox({
+      type: 'info',
+      title: APP_NAME,
+      message: '数据备份恢复完成。',
+      detail: 'Harness 已重新启动。',
+    })
+  } catch (error) {
+    console.warn('Data restore failed:', error.message)
+    sendStatus('数据恢复失败', 'warn')
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: '数据恢复失败。',
+      detail: error.message,
+    })
+    // 无论恢复结果如何，都尽量把 Harness 拉起来。
+    try {
+      if (!harnessProcess) {
+        const url = await startHarness()
+        sendUrlToWindow(url)
+      }
+    } catch {}
+  } finally {
+    restoreInProgress = false
+    suppressHarnessExitError = false
+  }
 }
 
 async function start() {
@@ -548,6 +930,7 @@ async function start() {
   installAppMenu()
   // Show the window (loading screen) immediately; never block startup on network calls.
   createWindow()
+  createTray()
   // Update check runs in the background and must not delay harness startup.
   checkForUpdates().catch(error => console.warn('Update check failed:', error.message))
   const url = await startHarness()
@@ -559,12 +942,12 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.focus()
-    }
+    showMainWindow()
   })
-  app.whenReady().then(start).catch(error => {
+  app.whenReady().then(() => {
+    if (process.platform === 'win32') app.setAppUserModelId('com.kevinzjyang.dshport')
+    return start()
+  }).catch(error => {
     dialog.showErrorBox(APP_NAME, error.stack || error.message)
     app.quit()
   })
@@ -572,13 +955,37 @@ if (!gotLock) {
 
 app.on('before-quit', () => {
   shuttingDown = true
+  quitting = true
   if (harnessProcess && !harnessProcess.killed) {
     harnessProcess.kill()
     harnessProcess = undefined
   }
 })
 
+// 窗口关闭只是隐藏到托盘；生命周期由托盘菜单的“退出”控制。
+app.on('window-all-closed', () => {})
+
 ipcMain.handle('open-log-folder', () => shell.openPath(logsRoot))
+ipcMain.handle('open-data-folder', () => shell.openPath(dataRoot))
 ipcMain.handle('restart-harness', () => restartHarness())
 ipcMain.handle('check-for-updates', () => checkForUpdates({ manual: true }))
 ipcMain.handle('show-about', () => showAbout())
+ipcMain.handle('backup-data', () => backupData())
+ipcMain.handle('restore-data', () => restoreData())
+ipcMain.handle('data-manage', async () => {
+  const answer = await dialog.showMessageBox({
+    type: 'info',
+    title: APP_NAME,
+    message: '数据管理',
+    detail: [
+      `数据目录：${dataRoot}`,
+      '备份文件不包含 updates/ 目录。',
+    ].join('\n'),
+    buttons: ['备份数据', '恢复备份', '取消'],
+    defaultId: 0,
+    cancelId: 2,
+  })
+  if (answer.response === 0) await backupData()
+  else if (answer.response === 1) await restoreData()
+})
+

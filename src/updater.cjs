@@ -35,12 +35,35 @@ function getJson(url) {
   })
 }
 
-async function download(url, path) {
-  const response = await fetch(url, { redirect: 'follow' })
-  if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`)
-  await pipeline(response.body, createWriteStream(path))
+// 直连失败时自动改用代理重试一次（与主程序的 DSH_UPDATE_PROXY 逻辑一致）。
+function updaterProxiedUrl(url) {
+  const raw = process.env.DSH_UPDATE_PROXY
+  const proxy = raw === '0' || raw === 'off' || raw === 'false' ? '' : (raw || 'https://gh.yiun.cyou/')
+  if (!proxy || url.startsWith(proxy) || !/^https?:\/\//u.test(url)) return url
+  return `${proxy}${url}`
 }
 
+async function download(url, path) {
+  const attempts = [url]
+  const fallback = updaterProxiedUrl(url)
+  if (fallback !== url) attempts.push(fallback)
+  let lastError
+  for (const attempt of attempts) {
+    try {
+      const response = await Promise.race([
+        fetch(attempt, { redirect: 'follow' }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('连接超时')), 20000)),
+      ])
+      if (!response.ok || !response.body) throw new Error(`Download failed: ${response.status}`)
+      await pipeline(response.body, createWriteStream(path))
+      return
+    } catch (error) {
+      lastError = error
+      console.warn(`Download failed via ${attempt}: ${error.message}`)
+    }
+  }
+  throw lastError
+}
 async function sha256(path) {
   const hash = createHash('sha256')
   hash.update(await readFile(path))
@@ -218,3 +241,4 @@ main().catch(async error => {
   }
   process.exitCode = 1
 })
+

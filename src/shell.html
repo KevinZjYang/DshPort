@@ -40,6 +40,7 @@
         font: inherit;
         font-size: 13px;
         cursor: pointer;
+        white-space: nowrap;
       }
 
       button:hover {
@@ -48,6 +49,24 @@
 
       button:active {
         background: #e5eaf1;
+      }
+
+      .status {
+        margin-left: auto;
+        padding: 0 4px;
+        font-size: 12px;
+        color: #6b7280;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .status.ok {
+        color: #15803d;
+      }
+
+      .status.warn {
+        color: #b45309;
       }
 
       iframe {
@@ -91,7 +110,9 @@
       <button id="openLogs" type="button">打开日志目录</button>
       <button id="restart" type="button">重启 Harness</button>
       <button id="updates" type="button">检查更新</button>
+      <button id="dataManage" type="button">数据管理</button>
       <button id="about" type="button">关于</button>
+      <span id="status" class="status"></span>
     </div>
     <div id="loading" class="loading">
       <div class="spinner"></div>
@@ -101,6 +122,7 @@
     <script>
       const frame = document.getElementById('harness')
       const loading = document.getElementById('loading')
+      const statusEl = document.getElementById('status')
 
       function loadUrl(url) {
         if (!url) return
@@ -113,6 +135,11 @@
       const initialUrl = new URLSearchParams(location.search).get('url')
       if (initialUrl) loadUrl(initialUrl)
 
+      window.deepseekHarnessDesktop.onAppStatus(({ text, kind = 'info' }) => {
+        statusEl.textContent = text
+        statusEl.className = 'status ' + kind
+      })
+
       document.getElementById('openLogs').addEventListener('click', () => {
         window.deepseekHarnessDesktop.openLogFolder()
       })
@@ -120,11 +147,16 @@
         loading.hidden = false
         frame.hidden = true
         frame.src = 'about:blank'
+        statusEl.textContent = '正在重启 Harness…'
+        statusEl.className = 'status info'
         const url = await window.deepseekHarnessDesktop.restartHarness()
         if (url) loadUrl(url)
       })
       document.getElementById('updates').addEventListener('click', () => {
         window.deepseekHarnessDesktop.checkForUpdates()
+      })
+      document.getElementById('dataManage').addEventListener('click', () => {
+        window.deepseekHarnessDesktop.dataManage()
       })
       document.getElementById('about').addEventListener('click', () => {
         window.deepseekHarnessDesktop.showAbout()
