@@ -79,8 +79,14 @@ async function generateIcon() {
   const png = join(projectRoot, 'resources', 'icon.png')
   const ico = join(projectRoot, 'resources', 'icon.ico')
   await mkdir(dirname(png), { recursive: true })
-  await sharp(await readFile(source)).resize(256, 256).png().toFile(png)
-  await writeFile(ico, await pngToIco([png]))
+  const svg = await readFile(source)
+  const sizes = [16, 32, 48, 64, 128, 256]
+  const pngs = []
+  for (const size of sizes) {
+    pngs.push(await sharp(svg).resize(size, size).png().toBuffer())
+  }
+  await writeFile(png, pngs[pngs.length - 1])
+  await writeFile(ico, await pngToIco(pngs))
 }
 
 async function prepareNode() {
