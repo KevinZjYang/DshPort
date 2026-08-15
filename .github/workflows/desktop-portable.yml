@@ -153,8 +153,20 @@ jobs:
               release.body?.includes(`上游引用：${upstreamRef}`),
             )
 
-            const stableVersions = releases
-              .map(release => release.tag_name.match(/^v(\d+)\.(\d+)\.(\d+)$/))
+            // Version history comes from git tags as well as releases: releases may be
+            // cleaned up (deleted) while tags remain, and the next version must never
+            // go backwards.
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            })
+            const versionStrings = [...new Set([
+              ...releases.map(release => release.tag_name),
+              ...tags.map(tag => tag.name),
+            ])]
+            const stableVersions = versionStrings
+              .map(tag => tag.match(/^v(\d+)\.(\d+)\.(\d+)$/))
               .filter(Boolean)
               .map(match => match.slice(1).map(Number))
               .sort((a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2])
@@ -162,11 +174,11 @@ jobs:
             let dshPortVersion = forcedDshPortVersion.replace(/^v/, '')
             if (!dshPortVersion) {
               if (stableVersions.length === 0) {
-                dshPortVersion = '0.1.0'
-              } else {
-                const latest = stableVersions.at(-1)
-                dshPortVersion = `${latest[0]}.${latest[1]}.${latest[2] + 1}`
+                core.setFailed('Cannot determine the next DshPort version (no release or tag history). Pass the version input explicitly.')
+                return
               }
+              const latest = stableVersions.at(-1)
+              dshPortVersion = `${latest[0]}.${latest[1]}.${latest[2] + 1}`
             }
 
             const releaseTag = `v${dshPortVersion}`
