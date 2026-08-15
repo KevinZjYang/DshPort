@@ -8,7 +8,7 @@ const { request } = require('node:https')
 const { spawn } = require('node:child_process')
 const { releaseTagUrl } = require('./portable-paths.cjs')
 
-const [, , executablePath, version, repository, component = 'auto', parentPid] = process.argv
+const [, , executablePath, version, repository, component = 'auto', parentPid, localArchive] = process.argv
 if (!executablePath || !version || !repository) process.exit(2)
 
 function getJson(url) {
@@ -168,15 +168,40 @@ async function updateWholePortable(release, temp) {
   if (await exists(dataHold)) await rename(dataHold, dataPath)
 }
 
+async function installFromLocal(archive, temp) {
+  const appRoot = dirname(executablePath)
+  const extractRoot = join(temp, 'local')
+  await extractZip(archive, extractRoot)
+  await reportProgress('正在替换文件…')
+  if (component === 'harness') {
+    const harnessRoot = join(appRoot, 'resources', 'harness')
+    await replaceDirectory(harnessRoot, await singleExtractedRoot(extractRoot))
+  } else {
+    const sourceRoot = await singleExtractedRoot(extractRoot)
+    const dataPath = join(appRoot, 'data')
+    const dataHold = join(temp, 'data')
+    if (await exists(dataPath)) await rename(dataPath, dataHold)
+    await replaceDirectory(appRoot, sourceRoot)
+    if (await exists(dataHold)) await rename(dataHold, dataPath)
+  }
+  // The archive was downloaded by the app in the background; clean it up with its pending marker.
+  await rm(archive, { force: true })
+  await rm(join(appRoot, 'data', 'updates', 'pending.json'), { force: true })
+}
+
 async function main() {
-  const release = await getJson(releaseTagUrl(repository, version))
   const temp = await mkdtemp(join(tmpdir(), 'dsh-update-'))
   progressFile = join(temp, 'progress.txt')
   await reportProgress('准备更新…')
   startProgressWindow(progressFile)
   await waitForProcessExit(parentPid)
-  const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
-  if (!updatedHarness) await updateWholePortable(release, temp)
+  if (localArchive) {
+    await installFromLocal(localArchive, temp)
+  } else {
+    const release = await getJson(releaseTagUrl(repository, version))
+    const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
+    if (!updatedHarness) await updateWholePortable(release, temp)
+  }
   await reportProgress('COMPLETE')
   spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' }).unref()
 }

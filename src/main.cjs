@@ -1,9 +1,10 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron')
 const { spawn } = require('node:child_process')
-const { existsSync, mkdirSync, readFileSync } = require('node:fs')
+const { createHash } = require('node:crypto')
+const { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
-const { dirname, join } = require('node:path')
+const { basename, dirname, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
 
 const APP_NAME = 'DshPort'
@@ -15,6 +16,7 @@ const runtimeRoot = isPackaged ? process.resourcesPath : join(__dirname, '..', '
 const portableRoot = isPackaged ? dirname(process.execPath) : join(__dirname, '..', '..')
 const { dataRoot, dshHome, workspace, logsRoot } = portableDataPaths(portableRoot)
 const iconPath = join(__dirname, '..', 'resources', 'icon.ico')
+const updatesDir = join(dataRoot, 'updates')
 
 let mainWindow
 let harnessProcess
@@ -23,9 +25,17 @@ let suppressHarnessExitError = false
 let activeUrl
 let pendingUrl
 let windowLoaded = false
+let backgroundDownload = null
+let installPromptOpen = false
 
 function ensureDirectories() {
-  for (const path of [dataRoot, dshHome, workspace, logsRoot]) mkdirSync(path, { recursive: true })
+  for (const path of [dataRoot, dshHome, workspace, logsRoot, updatesDir]) mkdirSync(path, { recursive: true })
+  // Clean up stale partial downloads from an interrupted run.
+  try {
+    for (const file of readdirSync(updatesDir)) {
+      if (file.endsWith('.part')) rmSync(join(updatesDir, file), { force: true })
+    }
+  } catch {}
 }
 
 function getVersion() {
@@ -228,10 +238,130 @@ function parseReleaseHarnessVersion(release) {
   return match ? match[1].trim() : undefined
 }
 
-function sizeOf(release, kind) {
-  const pattern = kind === 'harness' ? /harness-runtime\.zip$/u : /DshPort-win-x64\.zip$/u
-  const asset = release.assets?.find(item => pattern.test(item.name))
-  return asset?.size ? `（约 ${Math.round(asset.size / 1048576)} MB）` : ''
+function readPendingUpdate() {
+  try {
+    const file = join(updatesDir, 'pending.json')
+    if (!existsSync(file)) return null
+    const pending = JSON.parse(readFileSync(file, 'utf8'))
+    return pending && typeof pending.archive === 'string' && existsSync(pending.archive) ? pending : null
+  } catch {
+    return null
+  }
+}
+
+function writePendingUpdate(pending) {
+  mkdirSync(updatesDir, { recursive: true })
+  writeFileSync(join(updatesDir, 'pending.json'), JSON.stringify(pending, null, 2))
+}
+
+function discardPendingUpdate() {
+  try { rmSync(join(updatesDir, 'pending.json'), { force: true }) } catch {}
+}
+
+async function downloadFile(url, target, onProgress) {
+  const response = await fetch(url, { redirect: 'follow' })
+  if (!response.ok || !response.body) throw new Error(`Download failed: HTTP ${response.status}`)
+  const total = Number(response.headers.get('content-length')) || 0
+  let received = 0
+  const reader = response.body.getReader()
+  const stream = createWriteStream(target)
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += value.length
+      if (!stream.write(value)) await new Promise(resolve => stream.once('drain', resolve))
+      if (typeof onProgress === 'function') onProgress(received, total)
+    }
+  } catch (error) {
+    stream.destroy()
+    throw error
+  }
+  await new Promise((resolve, reject) => stream.end(error => error ? reject(error) : resolve()))
+}
+
+function sha256Of(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('data', chunk => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+async function verifyDownloadedChecksum(release, archive) {
+  const checksumAsset = release.assets?.find(item => item.name === 'SHA256SUMS.txt')
+  if (!checksumAsset) return true
+  try {
+    const target = join(updatesDir, 'SHA256SUMS.txt')
+    await downloadFile(checksumAsset.browser_download_url, target)
+    const text = readFileSync(target, 'utf8')
+    const expected = text.split(/\r?\n/u).find(line => line.includes(basename(archive)))?.split(/\s+/u)[0]
+    if (!expected) return false
+    return expected.toLowerCase() === (await sha256Of(archive)).toLowerCase()
+  } catch {
+    return false
+  }
+}
+
+async function startBackgroundDownload(release, component) {
+  const asset = release.assets?.find(item =>
+    component === 'harness' ? item.name === 'harness-runtime.zip' : /DshPort-win-x64\.zip$/u.test(item.name))
+  if (!asset) return
+  const archive = join(updatesDir, asset.name)
+  const pending = { tag: String(release.tag_name || ''), component, archive }
+  if (!existsSync(archive)) {
+    if (backgroundDownload) return
+    backgroundDownload = (async () => {
+      const partial = `${archive}.part`
+      rmSync(partial, { force: true })
+      await downloadFile(asset.browser_download_url, partial)
+      const ok = await verifyDownloadedChecksum(release, partial)
+      if (!ok) {
+        rmSync(partial, { force: true })
+        throw new Error('Checksum verification failed')
+      }
+      rmSync(archive, { force: true })
+      renameSync(partial, archive)
+    })().finally(() => { backgroundDownload = null })
+  }
+  try {
+    await backgroundDownload
+  } catch (error) {
+    console.warn('Background update download failed:', error.message)
+    return
+  }
+  if (!existsSync(archive)) return
+  writePendingUpdate(pending)
+  promptInstallUpdate(pending)
+}
+
+async function promptInstallUpdate(pending) {
+  if (installPromptOpen) return
+  installPromptOpen = true
+  try {
+    const size = existsSync(pending.archive) ? Math.round(statSync(pending.archive).size / 1048576) : 0
+    const versionLabel = String(pending.tag || '').replace(/^v/u, '')
+    const answer = await dialog.showMessageBox({
+      type: 'info',
+      title: APP_NAME,
+      message: pending.component === 'harness'
+        ? `Harness 更新已下载完成（约 ${size} MB）`
+        : `DshPort ${versionLabel} 更新已下载完成（约 ${size} MB）`,
+      detail: [
+        '更新包已在后台下载完成，可以随时安装。',
+        '安装时应用会短暂关闭，完成后自动重新启动。',
+        'data/ 下的数据会保留。',
+      ].join('\n'),
+      buttons: ['立即安装', '稍后'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (answer.response === 0) launchUpdater(pending.tag, pending.component, pending.archive)
+  } finally {
+    installPromptOpen = false
+  }
 }
 
 async function checkForUpdates({ manual = false } = {}) {
@@ -255,6 +385,18 @@ async function checkForUpdates({ manual = false } = {}) {
     const harnessLocal = getHarnessVersion()
     const shellOutdated = latest !== '' && latest !== localVersion && compareVersionsSafe(latest, localVersion)
     const harnessOutdated = harnessLatest !== undefined && harnessLatest !== harnessLocal && compareVersionsSafe(harnessLatest, harnessLocal)
+
+    // A previously downloaded update may still be waiting to be installed.
+    const pending = readPendingUpdate()
+    if (pending) {
+      const pendingTag = String(pending.tag || '').replace(/^v/u, '')
+      if (pendingTag !== '' && pendingTag === latest && pendingTag !== localVersion) {
+        promptInstallUpdate(pending)
+        return
+      }
+      discardPendingUpdate()
+    }
+
     if (!shellOutdated && !harnessOutdated) {
       if (manual) {
         await dialog.showMessageBox({
@@ -267,56 +409,26 @@ async function checkForUpdates({ manual = false } = {}) {
       return
     }
 
-    let message
-    let detail
-    let buttons
-    let component = 'portable'
-    if (shellOutdated && harnessOutdated) {
-      message = `发现新版本：DshPort ${latest} / Harness ${harnessLatest}`
-      detail = [
-        `DshPort 版本：${localVersion} → ${latest}`,
-        `Harness 版本：${harnessLocal} → ${harnessLatest}`,
-        '',
-        `完整更新${sizeOf(release, 'portable')}；或仅更新 Harness 运行时${sizeOf(release, 'harness')}。`,
-        'data/ 下的数据会保留。',
-      ].join('\n')
-      buttons = ['完整更新', '仅更新 Harness 运行时', '跳过']
-    } else if (shellOutdated) {
-      message = `发现新版本：DshPort ${latest}`
-      detail = [
-        `DshPort 版本：${localVersion} → ${latest}`,
-        `Harness 版本：${harnessLocal}（已最新）`,
-        '',
-        `替换完整便携应用${sizeOf(release, 'portable')}。`,
-        'data/ 下的数据会保留。',
-      ].join('\n')
-      buttons = ['更新', '跳过']
-    } else {
-      message = `发现新的 Harness 版本：${harnessLatest}`
-      component = 'harness'
-      detail = [
-        `DshPort 版本：${localVersion}（已最新）`,
-        `Harness 版本：${harnessLocal} → ${harnessLatest}`,
-        '',
-        `仅替换 Harness 运行时${sizeOf(release, 'harness')}，外壳文件不变。`,
-        'data/ 下的数据会保留。',
-      ].join('\n')
-      buttons = ['更新', '跳过']
+    if (backgroundDownload) {
+      if (manual) {
+        await dialog.showMessageBox({
+          type: 'info',
+          title: APP_NAME,
+          message: '更新正在后台下载中，完成后会提示安装。',
+        })
+      }
+      return
     }
 
-    const answer = await dialog.showMessageBox({
-      type: 'info',
-      title: APP_NAME,
-      message,
-      detail,
-      buttons,
-      defaultId: 0,
-      cancelId: buttons.length - 1,
-    })
-    if (answer.response === 0) launchUpdater(release, component)
-    else if (buttons.length === 3 && answer.response === 1) launchUpdater(release, 'harness')
+    // Download in the background first; the user installs only after it is ready.
+    await startBackgroundDownload(release, shellOutdated ? 'portable' : 'harness')
   } catch (error) {
     console.warn('Update check failed:', error.message)
+    const pending = readPendingUpdate()
+    if (pending) {
+      promptInstallUpdate(pending)
+      return
+    }
     if (error.statusCode === 404) {
       if (manual) {
         await dialog.showMessageBox({
@@ -388,18 +500,16 @@ async function checkSourceVersion() {
   }
 }
 
-function launchUpdater(release, component) {
+function launchUpdater(tagName, component, localArchive) {
   const updater = join(runtimeRoot, 'updater', 'updater.cjs')
   const nodePath = join(runtimeRoot, 'node', process.platform === 'win32' ? 'node.exe' : 'node')
   if (!existsSync(updater)) {
     dialog.showErrorBox(APP_NAME, `Updater not found: ${updater}`)
     return
   }
-  const tagName = String(release.tag_name)
-  if (!component) {
-    component = release.assets?.some(asset => /DshPort-win-x64\.zip$/u.test(asset.name)) ? 'portable' : 'harness'
-  }
-  spawn(nodePath, [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)], {
+  const args = [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)]
+  if (localArchive) args.push(localArchive)
+  spawn(nodePath, args, {
     detached: true,
     windowsHide: true,
     stdio: 'ignore',
