@@ -29,6 +29,8 @@ jobs:
       release_tag: ${{ steps.detect.outputs.release_tag }}
       release_title: ${{ steps.detect.outputs.release_title }}
       upstream_url: ${{ steps.detect.outputs.upstream_url }}
+      previous_tag: ${{ steps.detect.outputs.previous_tag }}
+      prev_harness_version: ${{ steps.detect.outputs.prev_harness_version }}
     steps:
       - id: detect
         uses: actions/github-script@v8
@@ -201,12 +203,44 @@ jobs:
             core.setOutput('release_title', `DshPort ${releaseTag}`)
             core.setOutput('upstream_url', upstreamUrl)
 
+            // Previous release tag used to build the changelog section in the
+            // release body: the newest stable tag at or below this release.
+            // On a fresh release that tag does not exist yet, so "at or below"
+            // resolves to the previous release; on a forced rebuild of an
+            // existing tag it resolves to that tag itself, showing the commits
+            // since it was last built.
+            const thisVersion = dshPortVersion.split('.').map(Number)
+            const previousStable = stableVersions
+              .filter(v => v[0] < thisVersion[0] || (v[0] === thisVersion[0] && v[1] < thisVersion[1]) || (v[0] === thisVersion[0] && v[1] === thisVersion[1] && v[2] <= thisVersion[2]))
+              .at(-1)
+            core.setOutput('previous_tag', previousStable ? `v${previousStable.join('.')}` : '')
+
+            // Previous Harness version, read from the newest previously released
+            // body (strictly below this release). Releases record the upstream
+            // version as "上游版本：x.y.z", which is the bundled @deepseek-ai/dsh
+            // package version — the Harness runtime this release ships.
+            const prevHarnessRelease = releases
+              .map(release => ({ release, version: (release.tag_name || '').match(/^v(\d+)\.(\d+)\.(\d+)$/u) }))
+              .filter(entry => entry.version !== null)
+              .map(entry => ({ release: entry.release, version: entry.version.slice(1).map(Number) }))
+              .filter(entry =>
+                entry.version[0] < thisVersion[0] ||
+                (entry.version[0] === thisVersion[0] && entry.version[1] < thisVersion[1]) ||
+                (entry.version[0] === thisVersion[0] && entry.version[1] === thisVersion[1] && entry.version[2] < thisVersion[2]),
+              )
+              .sort((a, b) => b.version[0] - a.version[0] || b.version[1] - a.version[1] || b.version[2] - a.version[2])
+              .at(0)
+            const prevHarnessVersion = (prevHarnessRelease?.release.body || '').match(/上游版本：\s*([0-9][^\s\r\n]*)/u)?.[1] || ''
+            core.setOutput('prev_harness_version', prevHarnessVersion)
+
   windows-x64:
     needs: detect-upstream
     if: needs.detect-upstream.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 11.19.0
@@ -224,6 +258,52 @@ jobs:
         env:
           DSHPORT_VERSION: ${{ needs.detect-upstream.outputs.release_tag }}
       - run: npm run smoke:package
+      - name: 生成更新日志
+        shell: bash
+        run: |
+          PREV="${{ needs.detect-upstream.outputs.previous_tag }}"
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+          {
+            echo "DshPort Windows 便携版自动构建。"
+            echo ""
+            echo "上游项目：${{ needs.detect-upstream.outputs.upstream_url }}"
+            echo "上游版本：${{ needs.detect-upstream.outputs.upstream_version }}"
+            echo "上游引用：${{ needs.detect-upstream.outputs.upstream_ref }}"
+            echo ""
+            echo "## 更新内容"
+            echo ""
+            HARNESS_PREV="${{ needs.detect-upstream.outputs.prev_harness_version }}"
+            HARNESS_CUR="${{ needs.detect-upstream.outputs.upstream_version }}"
+            if [ -n "$HARNESS_PREV" ] && [ "$HARNESS_PREV" != "$HARNESS_CUR" ]; then
+              echo "- Harness 版本：$HARNESS_PREV → $HARNESS_CUR"
+            elif [ -n "$HARNESS_PREV" ] && [ "$HARNESS_PREV" = "$HARNESS_CUR" ]; then
+              echo "- Harness 版本：$HARNESS_CUR（与上次发布相同）"
+            elif [ -n "$HARNESS_CUR" ]; then
+              echo "- Harness 版本：$HARNESS_CUR"
+            fi
+            echo ""
+            if [ -n "$PREV" ]; then
+              echo "自上次发布（$PREV）以来的变更："
+            else
+              echo "首次发布："
+            fi
+            echo ""
+            LOG="$(git log --no-merges --pretty=format:'- [%h](https://github.com/${{ github.repository }}/commit/%h) %s' "$RANGE")"
+            if [ -n "$LOG" ]; then
+              echo "$LOG"
+            else
+              echo "本次没有新的 DshPort 提交（可能仅上游版本更新）。"
+            fi
+            echo ""
+            echo "下载说明："
+            echo "- DshPort-win-x64.zip：完整 Windows x64 便携包，首次使用下载这个"
+            echo "- harness-runtime.zip：仅 Harness 运行时更新包，供后续增量更新使用"
+            echo "- SHA256SUMS.txt：SHA-256 校验文件"
+          } > release-body.md
       - uses: actions/upload-artifact@v4
         with:
           name: DshPort-win-x64
@@ -236,17 +316,7 @@ jobs:
           tag_name: ${{ needs.detect-upstream.outputs.release_tag }}
           name: ${{ needs.detect-upstream.outputs.release_title }}
           prerelease: false
-          body: |
-            DshPort Windows 便携版自动构建。
-
-            上游项目：${{ needs.detect-upstream.outputs.upstream_url }}
-            上游版本：${{ needs.detect-upstream.outputs.upstream_version }}
-            上游引用：${{ needs.detect-upstream.outputs.upstream_ref }}
-
-            下载说明：
-            - DshPort-win-x64.zip：完整 Windows x64 便携包，首次使用下载这个
-            - harness-runtime.zip：仅 Harness 运行时更新包，供后续增量更新使用
-            - SHA256SUMS.txt：SHA-256 校验文件
+          body_path: release-body.md
           files: |
             dist-exe/desktop/DshPort-win-x64.zip
             dist-exe/desktop/harness-runtime.zip
