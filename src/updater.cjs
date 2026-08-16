@@ -290,6 +290,31 @@ async function spawnBackupCleanup(backupDir) {
   deferredCleanup = true
 }
 
+// 更新完成后拉起新应用：确认进程没有秒退（如单实例锁被占用），失败则重试。
+// 启动失败不影响已完成的更新，最终仍由用户手动启动兜底。
+async function relaunchApp() {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let child
+    try {
+      child = spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' })
+    } catch (error) {
+      console.warn(`App relaunch attempt ${attempt} failed: ${error.message}`)
+      await new Promise(resolve => setTimeout(resolve, 2000))
+      continue
+    }
+    child.once('error', () => {})
+    child.unref()
+    await new Promise(resolve => setTimeout(resolve, 2500))
+    try {
+      process.kill(child.pid, 0)
+      console.warn(`App relaunched (pid ${child.pid})`)
+      return
+    } catch {
+      console.warn(`App relaunch attempt ${attempt} exited immediately`)
+    }
+  }
+}
+
 async function waitForProcessExit(pid, timeoutMs = 30000) {
   if (!pid || !/^\d+$/u.test(pid)) return
   const started = Date.now()
@@ -415,13 +440,7 @@ async function main() {
     }
     await reportProgress('COMPLETE')
     success = true
-    try {
-      const relaunch = spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' })
-      relaunch.once('error', () => {})
-      relaunch.unref()
-    } catch {
-      // 启动失败不影响已完成的更新；用户手动启动即可。
-    }
+    await relaunchApp()
   } finally {
     if (logStream) { try { logStream.end() } catch {} }
     // 成功才清理临时目录（除非已交给延迟清理进程）；失败时保留现场便于诊断。

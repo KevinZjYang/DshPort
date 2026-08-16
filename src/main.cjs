@@ -312,6 +312,18 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => {
     mainWindow.show()
   })
+  // 保底显示：ready-to-show 依赖渲染进程完成首次绘制；更新后首次启动时杀软扫描等
+  // 因素可能让首次绘制迟迟不来，窗口会一直 hidden（只剩托盘图标）。超时后强制显示，
+  // 让用户至少能看到窗口（可能是加载页）。
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show()
+    }
+  }, 8000)
+  // shell.html 加载失败不应让窗口永远不可见。
+  mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
+    console.warn(`shell load failed: ${code} ${description}`)
+  })
   // shell.html shows a loading screen; the harness URL arrives via IPC once ready.
   mainWindow.loadFile(join(__dirname, 'shell.html'))
   mainWindow.webContents.once('did-finish-load', () => {
