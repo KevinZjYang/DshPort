@@ -1,4 +1,4 @@
-﻿﻿param(
+﻿param(
   [string]$StatusFile,
   [string]$UpdaterPid = ''
 )
@@ -48,7 +48,7 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 400
 $timer.Add_Tick({
   $text = ''
-  if (Test-Path $StatusFile) {
+  if ($StatusFile -and (Test-Path $StatusFile -ErrorAction SilentlyContinue)) {
     $text = (Get-Content $StatusFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
     if ($text) { $status.Text = $text }
     try {

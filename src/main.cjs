@@ -60,6 +60,32 @@ function ensureDirectories() {
       if (file.endsWith('.part')) rmSync(join(updatesDir, file), { force: true })
     }
   } catch {}
+  cleanupStaleUpdateArtifacts()
+}
+
+// 清理上次更新遗留的旧应用备份目录与陈旧临时目录。
+// 整包更新成功后，旧目录由独立的清理进程删除；这里兜底处理清理进程未能
+// 删除（残留进程锁）或更新中断（改名后未完成）的情况。
+function cleanupStaleUpdateArtifacts() {
+  const parent = dirname(portableRoot)
+  const stem = basename(portableRoot).replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+  const backupPattern = new RegExp(`^${stem}\\.backup-\\d+(\\.failed-\\d+)?$`)
+  try {
+    for (const entry of readdirSync(parent, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const full = join(parent, entry.name)
+      if (backupPattern.test(entry.name)) {
+        rmSync(full, { recursive: true, force: true })
+      } else if (/^dsh-update-[A-Za-z0-9]{6}$/u.test(entry.name)) {
+        // 更新器临时目录与应用同盘（盘符根下）；超过 7 天的视为陈旧现场。
+        try {
+          if (statSync(full).mtimeMs < Date.now() - 7 * 24 * 60 * 60 * 1000) {
+            rmSync(full, { recursive: true, force: true })
+          }
+        } catch {}
+      }
+    }
+  } catch {}
 }
 
 function getVersion() {
@@ -159,6 +185,7 @@ function spawnHarness(port) {
 function stopHarness() {
   return new Promise(resolve => {
     const child = harnessProcess
+    harnessProcess = undefined
     if (!child || child.killed) return resolve()
     child.once('exit', resolve)
     child.kill()
@@ -569,7 +596,7 @@ async function promptInstallUpdate(pending) {
     })
     if (answer.response === 0) {
       sendStatus('正在安装更新…', 'info')
-      launchUpdater(pending.tag, pending.component, pending.archive)
+      await launchUpdater(pending.tag, pending.component, pending.archive)
     } else if (answer.response === 1) {
       pending.remindAfter = Date.now() + 24 * 60 * 60 * 1000
       writePendingUpdate(pending)
@@ -782,12 +809,17 @@ async function checkSourceVersion() {
   }
 }
 
-function launchUpdater(tagName, component, localArchive) {
+async function launchUpdater(tagName, component, localArchive) {
   const updater = join(runtimeRoot, 'updater', 'updater.cjs')
   const nodePath = join(runtimeRoot, 'node', process.platform === 'win32' ? 'node.exe' : 'node')
   if (!existsSync(updater)) {
     dialog.showErrorBox(APP_NAME, `未找到更新程序：${updater}`)
     return
+  }
+  // 更新会整体替换应用目录：先停掉并等 Harness 退出，释放 resources\node\node.exe
+  // 与 resources\harness 里原生插件上的文件锁（before-quit 的 kill 保留为兜底）。
+  if (harnessProcess) {
+    try { await stopHarness() } catch {}
   }
   const args = [updater, process.execPath, tagName, UPDATE_REPOSITORY, component, String(process.pid)]
   if (localArchive) args.push(localArchive)

@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto')
 const { createWriteStream, mkdirSync } = require('node:fs')
-const { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
+const { access, appendFile, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const { dirname, join } = require('node:path')
 const { request } = require('node:https')
@@ -178,10 +178,116 @@ async function replaceDirectory(target, source) {
     await cp(source, target, { recursive: true })
     await rm(backup, { recursive: true, force: true })
   } catch (error) {
-    await rm(target, { recursive: true, force: true })
-    if (await exists(backup)) await retryRename(backup, target)
+    // 回滚时先把残缺的新目录删掉，再恢复旧目录；恢复失败时保留现场供人工处理。
+    try { await rm(target, { recursive: true, force: true }) } catch {}
+    if (await exists(backup)) {
+      try { await retryRename(backup, target) } catch (restoreError) {
+        console.warn(`Rollback failed: ${restoreError.message}`)
+      }
+    }
     throw error
   }
+}
+
+// 整包替换（保留 data/）。关键点：本更新器进程的运行镜像就在 appRoot 内，
+// 替换后旧目录（backup）必然包含正在执行的 node.exe，Windows 不允许删除
+// 运行中的镜像（EPERM），因此删除必须推迟到本进程退出之后，由运行在
+// “新运行时”里的独立清理进程完成。更新成功与否不再依赖任何删除操作。
+async function swapPortableApp(sourceRoot) {
+  const appRoot = dirname(executablePath)
+  const backup = `${appRoot}.backup-${Date.now()}`
+  const dataPath = join(appRoot, 'data')
+  const dataHold = join(updateTemp, 'data')
+  if (await exists(dataPath)) await retryRename(dataPath, dataHold)
+  if (await exists(appRoot)) await retryRename(appRoot, backup)
+  try {
+    await cp(sourceRoot, appRoot, { recursive: true })
+  } catch (error) {
+    // 回滚：残缺的新目录改名靠边（绝不原地删除，避免应用目录进入残缺态），
+    // 再恢复旧应用与 data。
+    try { await rename(appRoot, `${backup}.failed-${Date.now()}`) } catch {}
+    if (await exists(backup)) {
+      try { await retryRename(backup, appRoot) } catch (restoreError) {
+        console.warn(`Rollback failed: ${restoreError.message}`)
+      }
+    }
+    if (await exists(dataHold)) {
+      try { await retryRename(dataHold, dataPath) } catch (dataError) {
+        console.warn(`Data restore failed: ${dataError.message}`)
+      }
+    }
+    throw error
+  }
+  if (await exists(dataHold)) await retryRename(dataHold, dataPath)
+  await spawnBackupCleanup(backup)
+  return backup
+}
+
+// 延迟清理进程：用新版的 node.exe 运行（其镜像不在 backup 内），等待本更新器
+// （镜像在 backup 内）退出后删除 backup，最后清理临时目录。
+const CLEANUP_HELPER = [
+  '// Deferred cleanup for a replaced DshPort install (spawned detached by the updater).',
+  "const { spawn } = require('node:child_process')",
+  "const { rm } = require('node:fs/promises')",
+  'const [, , backupDir, updaterPid, tempDir] = process.argv',
+  'const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))',
+  'async function waitForPidExit(pid, timeoutMs) {',
+  '  if (!pid || !/^\\d+$/u.test(pid)) return',
+  '  const started = Date.now()',
+  '  while (Date.now() - started < timeoutMs) {',
+  '    try { process.kill(Number(pid), 0) } catch { return }',
+  '    await sleep(500)',
+  '  }',
+  '}',
+  'async function killProcessesUnder(root) {',
+  '  const pattern = root.replace(/\\\'/g, "\\\'\\\'")',
+  '  const command = "Get-Process | Where-Object { $_.Path -and $_.Path -like \\\'" + pattern + "*\\\' } | Stop-Process -Force -ErrorAction SilentlyContinue"',
+  '  await new Promise(resolve => {',
+  "    const child = spawn('powershell.exe', ['-NoProfile', '-Command', command], { windowsHide: true, stdio: 'ignore' })",
+  '    child.once(\'exit\', () => resolve())',
+  '    child.once(\'error\', () => resolve())',
+  '  })',
+  '}',
+  'async function removeWithRetry(dir, attempts, delayMs) {',
+  '  for (let i = 0; i < attempts; i++) {',
+  '    try { await rm(dir, { recursive: true, force: true }); return true } catch {}',
+  '    await sleep(delayMs)',
+  '  }',
+  '  return false',
+  '}',
+  'async function main() {',
+  '  await waitForPidExit(updaterPid, 120000)',
+  '  if (!(await removeWithRetry(backupDir, 15, 1500))) {',
+  '    await killProcessesUnder(backupDir)',
+  '    await sleep(2000)',
+  '    await removeWithRetry(backupDir, 5, 1500)',
+  '  }',
+  '  // 留出时间让进度窗口读完 COMPLETE/FAILED 再清理现场。',
+  '  await sleep(5000)',
+  '  try { await rm(tempDir, { recursive: true, force: true }) } catch {}',
+  '}',
+  'main().catch(() => {})',
+].join('\n')
+
+async function spawnBackupCleanup(backupDir) {
+  const appRoot = dirname(executablePath)
+  const helperScript = join(updateTemp, 'cleanup-backup.cjs')
+  await writeFile(helperScript, CLEANUP_HELPER)
+  const newNode = join(appRoot, 'resources', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
+  if (!(await exists(newNode))) {
+    // 新包缺少 node 运行时（异常包）：更新本身已成功，backup 交给下次启动清理。
+    console.warn(`Cleanup helper runtime missing: ${newNode}; backup cleanup deferred to next start`)
+    return
+  }
+  const child = spawn(newNode, [helperScript, backupDir, String(process.pid), updateTemp], {
+    detached: true,
+    windowsHide: true,
+    stdio: 'ignore',
+    cwd: dirname(appRoot),
+  })
+  child.once('error', error => console.warn(`Cleanup helper failed to start: ${error.message}`))
+  child.unref()
+  deferredCleanup = true
 }
 
 async function waitForProcessExit(pid, timeoutMs = 30000) {
@@ -200,6 +306,10 @@ async function waitForProcessExit(pid, timeoutMs = 30000) {
 // --- update progress UI ---
 
 let progressFile = ''
+let updateTemp = ''
+// 整包替换后，旧应用目录（含本更新器自己的运行镜像）不能由本进程删除，
+// 改由独立的清理进程在退出后处理；在它接管前，本进程不得删除临时目录。
+let deferredCleanup = false
 
 function updaterDir() {
   return dirname(process.argv[1] || process.execPath)
@@ -207,16 +317,16 @@ function updaterDir() {
 
 function startProgressWindow(file) {
   const script = join(updaterDir(), 'update-progress.ps1')
-  try {
-    const child = spawn('powershell.exe', [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
-      '-StatusFile', file,
-      '-UpdaterPid', String(process.pid),
-    ], { detached: true, stdio: 'ignore' })
-    child.unref()
-  } catch {
-    // The progress window is best-effort; the update still proceeds without it.
-  }
+  const child = spawn('powershell.exe', [
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-StatusFile', file,
+    '-UpdaterPid', String(process.pid),
+  ], { detached: true, stdio: 'ignore' })
+  // 进度窗口是尽力而为，失败不应中断更新；但要把失败原因记进日志。
+  child.once('error', error => {
+    try { console.warn(`Progress window failed to start: ${error.message}`) } catch {}
+  })
+  child.unref()
 }
 
 async function reportProgress(text) {
@@ -262,14 +372,9 @@ async function updateWholePortable(release, temp) {
   await reportProgress('正在解压更新包…')
   const extractRoot = join(temp, 'portable')
   await extractZip(archive, extractRoot)
-  const appRoot = dirname(executablePath)
   const sourceRoot = await singleExtractedRoot(extractRoot)
-  const dataPath = join(appRoot, 'data')
-  const dataHold = join(temp, 'data')
   await reportProgress('正在替换文件…')
-  if (await exists(dataPath)) await retryRename(dataPath, dataHold)
-  await replaceDirectory(appRoot, sourceRoot)
-  if (await exists(dataHold)) await retryRename(dataHold, dataPath)
+  await swapPortableApp(sourceRoot)
 }
 
 async function installFromLocal(archive, temp) {
@@ -282,12 +387,7 @@ async function installFromLocal(archive, temp) {
     const harnessRoot = join(appRoot, 'resources', 'harness')
     await replaceDirectory(harnessRoot, await singleExtractedRoot(extractRoot))
   } else {
-    const sourceRoot = await singleExtractedRoot(extractRoot)
-    const dataPath = join(appRoot, 'data')
-    const dataHold = join(temp, 'data')
-    if (await exists(dataPath)) await retryRename(dataPath, dataHold)
-    await replaceDirectory(appRoot, sourceRoot)
-    if (await exists(dataHold)) await retryRename(dataHold, dataPath)
+    await swapPortableApp(await singleExtractedRoot(extractRoot))
   }
   // The archive was downloaded by the app in the background; clean it up with its pending marker.
   await rm(archive, { force: true })
@@ -295,30 +395,34 @@ async function installFromLocal(archive, temp) {
 }
 
 async function main() {
-  const temp = await makeTemp()
-  progressFile = join(temp, 'progress.txt')
-  const logStream = setupLogging(join(temp, 'updater.log'))
+  updateTemp = await makeTemp()
+  progressFile = join(updateTemp, 'progress.txt')
+  const logStream = setupLogging(join(updateTemp, 'updater.log'))
   let success = false
   try {
     await reportProgress('准备更新…')
     startProgressWindow(progressFile)
     await waitForProcessExit(parentPid)
     if (localArchive) {
-      await installFromLocal(localArchive, temp)
+      await installFromLocal(localArchive, updateTemp)
     } else {
       const release = await getJson(releaseTagUrl(repository, version))
-      const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
-      if (!updatedHarness) await updateWholePortable(release, temp)
+      const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, updateTemp)
+      if (!updatedHarness) await updateWholePortable(release, updateTemp)
     }
     await reportProgress('COMPLETE')
     success = true
-    const relaunch = spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' })
-    relaunch.once('error', () => {})
-    relaunch.unref()
+    try {
+      const relaunch = spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' })
+      relaunch.once('error', () => {})
+      relaunch.unref()
+    } catch {
+      // 启动失败不影响已完成的更新；用户手动启动即可。
+    }
   } finally {
     if (logStream) { try { logStream.end() } catch {} }
-    // 成功才清理临时目录；失败时保留 updater.log 与 progress.txt 便于诊断。
-    if (success) { try { await rm(temp, { recursive: true, force: true }) } catch {} }
+    // 成功才清理临时目录（除非已交给延迟清理进程）；失败时保留现场便于诊断。
+    if (success && !deferredCleanup) { try { await rm(updateTemp, { recursive: true, force: true }) } catch {} }
   }
 }
 
@@ -328,6 +432,9 @@ main().catch(async error => {
   if (progressFile) {
     try { await writeFile(progressFile, `FAILED ${error.message}`) } catch {}
   }
+  try {
+    await appendFile(join(updateTemp, 'updater.log'), `${new Date().toISOString()} FAILED ${error.stack || error.message}\n`).catch(() => {})
+  } catch {}
   try { console.error(error.stack || error.message) } catch {}
   process.exitCode = 1
 })
