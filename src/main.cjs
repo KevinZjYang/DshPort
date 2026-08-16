@@ -831,14 +831,14 @@ async function createDataBackup(targetZip) {
 
 async function createShortcuts(mode) {
   const script = [
-    'param($Mode, $Target, $WorkDir)',
+    'param($Mode, $Target, $WorkDir, $Icon)',
     '$ws = New-Object -ComObject WScript.Shell',
     'function New-Lnk($folder) {',
     "  $lnk = Join-Path $folder 'DshPort.lnk'",
     '  $s = $ws.CreateShortcut($lnk)',
     '  $s.TargetPath = $Target',
     '  $s.WorkingDirectory = $WorkDir',
-    '  $s.IconLocation = "$Target,0"',
+    '  $s.IconLocation = "$Icon,0"',
     "  $s.Description = 'DshPort'",
     '  $s.Save()',
     '  Write-Output ("CREATED " + $lnk)',
@@ -851,7 +851,7 @@ async function createShortcuts(mode) {
   try {
     const { stdout } = await runCommand('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptFile,
-      '-Mode', mode, '-Target', process.execPath, '-WorkDir', portableRoot,
+      '-Mode', mode, '-Target', process.execPath, '-WorkDir', portableRoot, '-Icon', iconPath,
     ])
     return (stdout.match(/^CREATED (.+)$/gmu) || []).map(line => line.replace(/^CREATED /u, '').trim())
   } finally {

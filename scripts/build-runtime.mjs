@@ -82,8 +82,9 @@ async function generateIcon() {
   const svg = await readFile(source)
   const sizes = [16, 32, 48, 64, 128, 256]
   const pngs = []
+  // 桌面快捷方式等场景需要纯白底色：生成时把透明区域填充为纯白。
   for (const size of sizes) {
-    pngs.push(await sharp(svg).resize(size, size).png().toBuffer())
+    pngs.push(await sharp(svg).resize(size, size).flatten({ background: '#ffffff' }).png().toBuffer())
   }
   await writeFile(png, pngs[pngs.length - 1])
   await writeFile(ico, await pngToIco(pngs))
