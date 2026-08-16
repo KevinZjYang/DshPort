@@ -1,4 +1,4 @@
-﻿param(
+﻿﻿param(
   [string]$StatusFile,
   [string]$UpdaterPid = ''
 )
@@ -52,7 +52,7 @@ $timer.Add_Tick({
     $text = (Get-Content $StatusFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue).Trim()
     if ($text) { $status.Text = $text }
     try {
-      if ($text -match '(d{1,3})%') {
+      if ($text -match '(\d{1,3})%') {
         $bar.Style = [System.Windows.Forms.ProgressBarStyle]::Blocks
         $bar.Value = [Math]::Min(100, [int]$Matches[1])
       } else {

@@ -1,5 +1,5 @@
 const { createHash } = require('node:crypto')
-const { createWriteStream } = require('node:fs')
+const { createWriteStream, mkdirSync } = require('node:fs')
 const { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const { dirname, join } = require('node:path')
@@ -14,6 +14,21 @@ function releaseTagUrl(repository, tagName) {
 
 const [, , executablePath, version, repository, component = 'auto', parentPid, localArchive] = process.argv
 if (!executablePath || !version || !repository) process.exit(2)
+
+// 应用退出后原管道（app 侧的 updater.log 流）即失效；更新器自己把 stdout/stderr
+// 重定向到临时目录的 updater.log。注意日志绝不能放在 appRoot/data 里：
+// 安装时需要 rename data/ 目录，任何打开的文件句柄都会导致 EPERM。
+function setupLogging(logPath) {
+  try {
+    const logStream = createWriteStream(logPath, { flags: 'a' })
+    const relay = chunk => logStream.write(chunk)
+    process.stdout.write = relay
+    process.stderr.write = relay
+    return logStream
+  } catch {
+    return null
+  }
+}
 
 function getJson(url) {
   return new Promise((resolve, reject) => {
@@ -110,6 +125,17 @@ async function verifyChecksum(release, asset, archive, temp) {
   }
 }
 
+// 临时目录必须与应用同盘：更新时 data/ 需要 rename 到临时目录做保留，
+// 跨盘 rename（如 E:\ -> C:\Temp）会报 EXDEV。放在便携根目录所在盘符的根下。
+async function makeTemp() {
+  const appRoot = dirname(executablePath)
+  try {
+    return await mkdtemp(join(dirname(appRoot), 'dsh-update-'))
+  } catch {
+    return await mkdtemp(join(tmpdir(), 'dsh-update-'))
+  }
+}
+
 async function extractZip(archive, target) {
   await mkdir(target, { recursive: true })
   const tar = process.platform === 'win32' ? 'tar.exe' : 'tar'
@@ -193,6 +219,7 @@ async function updateHarnessRuntime(release, temp) {
   })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
+  await reportProgress('正在解压更新包…')
   const extractRoot = join(temp, 'harness')
   await extractZip(archive, extractRoot)
   const appRoot = dirname(executablePath)
@@ -212,6 +239,7 @@ async function updateWholePortable(release, temp) {
   })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
+  await reportProgress('正在解压更新包…')
   const extractRoot = join(temp, 'portable')
   await extractZip(archive, extractRoot)
   const appRoot = dirname(executablePath)
@@ -227,6 +255,7 @@ async function updateWholePortable(release, temp) {
 async function installFromLocal(archive, temp) {
   const appRoot = dirname(executablePath)
   const extractRoot = join(temp, 'local')
+  await reportProgress('正在解压更新包…')
   await extractZip(archive, extractRoot)
   await reportProgress('正在替换文件…')
   if (component === 'harness') {
@@ -246,27 +275,40 @@ async function installFromLocal(archive, temp) {
 }
 
 async function main() {
-  const temp = await mkdtemp(join(tmpdir(), 'dsh-update-'))
+  const temp = await makeTemp()
   progressFile = join(temp, 'progress.txt')
-  await reportProgress('准备更新…')
-  startProgressWindow(progressFile)
-  await waitForProcessExit(parentPid)
-  if (localArchive) {
-    await installFromLocal(localArchive, temp)
-  } else {
-    const release = await getJson(releaseTagUrl(repository, version))
-    const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
-    if (!updatedHarness) await updateWholePortable(release, temp)
+  const logStream = setupLogging(join(temp, 'updater.log'))
+  let success = false
+  try {
+    await reportProgress('准备更新…')
+    startProgressWindow(progressFile)
+    await waitForProcessExit(parentPid)
+    if (localArchive) {
+      await installFromLocal(localArchive, temp)
+    } else {
+      const release = await getJson(releaseTagUrl(repository, version))
+      const updatedHarness = component !== 'portable' && await updateHarnessRuntime(release, temp)
+      if (!updatedHarness) await updateWholePortable(release, temp)
+    }
+    await reportProgress('COMPLETE')
+    success = true
+    const relaunch = spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' })
+    relaunch.once('error', () => {})
+    relaunch.unref()
+  } finally {
+    if (logStream) { try { logStream.end() } catch {} }
+    // 成功才清理临时目录；失败时保留 updater.log 与 progress.txt 便于诊断。
+    if (success) { try { await rm(temp, { recursive: true, force: true }) } catch {} }
   }
-  await reportProgress('COMPLETE')
-  spawn(executablePath, [], { detached: true, windowsHide: true, stdio: 'ignore' }).unref()
 }
 
 main().catch(async error => {
-  console.error(error.stack || error.message)
+  // 先把失败原因写进 progress.txt（进度窗口会显示），再尝试记日志；
+  // 日志流可能已在 finally 中 end()，console.error 需要防 write-after-end。
   if (progressFile) {
     try { await writeFile(progressFile, `FAILED ${error.message}`) } catch {}
   }
+  try { console.error(error.stack || error.message) } catch {}
   process.exitCode = 1
 })
 
