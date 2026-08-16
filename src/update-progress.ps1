@@ -3,6 +3,13 @@
   [string]$UpdaterPid = ''
 )
 
+# 更新器以普通 spawn 拉起本脚本时没有控制台，Windows 会新建一个可见的控制台窗口；
+# 在这里立即隐藏它，只保留进度表单。（不能由更新器用 windowsHide 隐藏——实测
+# CREATE_NO_WINDOW 会让 WinForms 窗口也不显示。）
+Add-Type -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);' -Name Win32Console -Namespace Native -PassThru | Out-Null
+$consoleHwnd = [Native.Win32Console]::GetConsoleWindow()
+if ($consoleHwnd -ne [IntPtr]::Zero) { [Native.Win32Console]::ShowWindow($consoleHwnd, 0) | Out-Null }
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 

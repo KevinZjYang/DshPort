@@ -342,14 +342,14 @@ function updaterDir() {
 
 function startProgressWindow(file) {
   const script = join(updaterDir(), 'update-progress.ps1')
-  // 不用 detached：进度窗口只需在更新器存活期间显示（更新器从启动到 COMPLETE 一直
-  // 活着）；DETACHED_PROCESS 会让 powershell 的 WinForms 窗口在部分机器上不显示。
-  // windowsHide 隐藏 powershell 的控制台窗口，只显示表单。
+  // 实测：detached（DETACHED_PROCESS）会让 powershell 直接退出；windowsHide
+  // （CREATE_NO_WINDOW）会让 WinForms 窗口不显示。只能用普通 spawn，
+  // 控制台窗口由 ps1 自己隐藏。
   const child = spawn('powershell.exe', [
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
     '-StatusFile', file,
     '-UpdaterPid', String(process.pid),
-  ], { stdio: 'ignore', windowsHide: true })
+  ], { stdio: 'ignore' })
   // 进度窗口是尽力而为，失败不应中断更新；但要把失败原因记进日志。
   child.once('error', error => {
     try { console.warn(`Progress window failed to start: ${error.message}`) } catch {}
@@ -443,6 +443,13 @@ async function main() {
     await relaunchApp()
   } finally {
     if (logStream) { try { logStream.end() } catch {} }
+    // 成功时临时目录会被清理（updater.log 随之丢失）：把本次日志追加到应用的
+    // data/logs/updater.log，便于后续诊断（如进度窗口未显示等）。
+    try {
+      const tail = await readFile(join(updateTemp, 'updater.log'), 'utf8').catch(() => '')
+      const persistent = join(dirname(executablePath), 'data', 'logs', 'updater.log')
+      await appendFile(persistent, `\n[${new Date().toISOString()}] updater finished, success=${success}\n${tail}`).catch(() => {})
+    } catch {}
     // 成功才清理临时目录（除非已交给延迟清理进程）；失败时保留现场便于诊断。
     if (success && !deferredCleanup) { try { await rm(updateTemp, { recursive: true, force: true }) } catch {} }
   }
