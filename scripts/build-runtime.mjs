@@ -82,9 +82,27 @@ async function generateIcon() {
   const svg = await readFile(source)
   const sizes = [16, 32, 48, 64, 128, 256]
   const pngs = []
-  // 桌面快捷方式等场景需要纯白底色：生成时把透明区域填充为纯白。
+  // 桌面快捷方式等场景需要纯白底色 + 圆角：生成白色圆角矩形底 + 居中图形。
+  function roundedBase(size) {
+    const inset = Math.round(size * 0.05)
+    const radius = Math.round(size * 0.18)
+    const w = size - 2 * inset
+    return Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">\n<rect x="${inset}" y="${inset}" width="${w}" height="${w}" rx="${radius}" fill="#ffffff"/>\n</svg>\n`,
+    )
+  }
   for (const size of sizes) {
-    pngs.push(await sharp(svg).resize(size, size).flatten({ background: '#ffffff' }).png().toBuffer())
+    const glyph = await sharp(svg).resize(Math.round(size * 0.9), Math.round(size * 0.9)).png().toBuffer()
+    const offset = Math.round((size - size * 0.9) / 2)
+    pngs.push(await sharp({
+      create: { width: size, height: size, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .composite([
+        { input: roundedBase(size), top: 0, left: 0 },
+        { input: glyph, top: offset, left: offset },
+      ])
+      .png()
+      .toBuffer())
   }
   await writeFile(png, pngs[pngs.length - 1])
   await writeFile(ico, await pngToIco(pngs))
