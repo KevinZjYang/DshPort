@@ -15,6 +15,10 @@ function releaseTagUrl(repository, tagName) {
 const [, , executablePath, version, repository, component = 'auto', parentPid, localArchive] = process.argv
 if (!executablePath || !version || !repository) process.exit(2)
 
+// 更新器自己的工作目录绝不能落在应用根目录里：replaceDirectory 要 rename 整个
+// 应用目录，若进程 cwd 在该目录内会报 EBUSY（“正在使用中”）。切到盘符根目录。
+try { process.chdir(dirname(dirname(executablePath))) } catch {}
+
 // 应用退出后原管道（app 侧的 updater.log 流）即失效；更新器自己把 stdout/stderr
 // 重定向到临时目录的 updater.log。注意日志绝不能放在 appRoot/data 里：
 // 安装时需要 rename data/ 目录，任何打开的文件句柄都会导致 EPERM。
@@ -151,15 +155,31 @@ async function singleExtractedRoot(extractRoot) {
   return entries.length === 1 && entries[0].isDirectory() ? join(extractRoot, entries[0].name) : extractRoot
 }
 
+// rename 可能因瞬时占用（杀软扫描、残留子进程）失败，重试几次再放弃。
+async function retryRename(from, to, attempts = 10, delayMs = 1000) {
+  let lastError
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await rename(from, to)
+      return
+    } catch (error) {
+      lastError = error
+      if (error.code !== 'EBUSY' && error.code !== 'EPERM' && error.code !== 'EACCES') throw error
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
+  }
+  throw lastError
+}
+
 async function replaceDirectory(target, source) {
   const backup = `${target}.backup-${Date.now()}`
-  if (await exists(target)) await rename(target, backup)
+  if (await exists(target)) await retryRename(target, backup)
   try {
     await cp(source, target, { recursive: true })
     await rm(backup, { recursive: true, force: true })
   } catch (error) {
     await rm(target, { recursive: true, force: true })
-    if (await exists(backup)) await rename(backup, target)
+    if (await exists(backup)) await retryRename(backup, target)
     throw error
   }
 }
@@ -247,9 +267,9 @@ async function updateWholePortable(release, temp) {
   const dataPath = join(appRoot, 'data')
   const dataHold = join(temp, 'data')
   await reportProgress('正在替换文件…')
-  if (await exists(dataPath)) await rename(dataPath, dataHold)
+  if (await exists(dataPath)) await retryRename(dataPath, dataHold)
   await replaceDirectory(appRoot, sourceRoot)
-  if (await exists(dataHold)) await rename(dataHold, dataPath)
+  if (await exists(dataHold)) await retryRename(dataHold, dataPath)
 }
 
 async function installFromLocal(archive, temp) {
@@ -265,9 +285,9 @@ async function installFromLocal(archive, temp) {
     const sourceRoot = await singleExtractedRoot(extractRoot)
     const dataPath = join(appRoot, 'data')
     const dataHold = join(temp, 'data')
-    if (await exists(dataPath)) await rename(dataPath, dataHold)
+    if (await exists(dataPath)) await retryRename(dataPath, dataHold)
     await replaceDirectory(appRoot, sourceRoot)
-    if (await exists(dataHold)) await rename(dataHold, dataPath)
+    if (await exists(dataHold)) await retryRename(dataHold, dataPath)
   }
   // The archive was downloaded by the app in the background; clean it up with its pending marker.
   await rm(archive, { force: true })

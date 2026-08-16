@@ -718,10 +718,13 @@ function launchUpdater(tagName, component, localArchive) {
   if (localArchive) args.push(localArchive)
   // Keep the updater's output in data/logs/updater.log so install failures are diagnosable.
   const logStream = createWriteStream(join(logsRoot, 'updater.log'), { flags: 'a' })
+  // cwd 必须位于应用根目录之外：更新器要 rename 整个应用目录，
+  // 若其工作目录在应用根目录内会报 EBUSY。
   const child = spawn(nodePath, args, {
     detached: true,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: dirname(portableRoot),
   })
   child.stdout.pipe(logStream)
   child.stderr.pipe(logStream)
