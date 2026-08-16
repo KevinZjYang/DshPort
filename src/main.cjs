@@ -817,7 +817,8 @@ function runCommand(command, args) {
 }
 
 // Windows 10 1803+ 自带 bsdtar，项目打包流程已依赖 tar 生成 zip。
-// 备份范围：模型设置（dsh-home）与工作区（workspace），不含日志、更新包与应用自身设置。
+// 备份范围：模型设置（dsh-home）与工作区（workspace），不含日志、更新包、
+// 应用自身设置，以及可重新生成的依赖（node_modules）。
 const BACKUP_ITEMS = ['dsh-home', 'workspace']
 
 async function createDataBackup(targetZip) {
@@ -825,7 +826,7 @@ async function createDataBackup(targetZip) {
   if (items.length === 0) {
     throw new Error('data/ 中缺少 dsh-home 或 workspace，没有可备份的数据')
   }
-  await runCommand('tar.exe', ['-a', '-cf', targetZip, '-C', dataRoot, ...items])
+  await runCommand('tar.exe', ['-a', '-cf', targetZip, '--exclude=node_modules', '-C', dataRoot, ...items])
 }
 
 async function createShortcuts(mode) {
