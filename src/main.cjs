@@ -535,6 +535,17 @@ async function startBackgroundDownload(release, component) {
   const archive = join(updatesDir, asset.name)
   const pending = { tag: String(release.tag_name || ''), component, archive }
   const versionLabel = normalizeTag(release.tag_name)
+  // 已存在的安装包可能来自旧版本（版本号已变）或已损坏：与当前发布版的校验和不符
+  // 时必须删掉重新下载，否则会把旧版本包当成新版本装上（表现为“更新后版本没变”）。
+  if (existsSync(archive)) {
+    const previousTag = readPendingUpdate()?.tag
+    const tagChanged = previousTag !== undefined && normalizeTag(previousTag) !== normalizeTag(release.tag_name)
+    const matches = await verifyDownloadedChecksum(release, archive, asset.name)
+    if (tagChanged || !matches) {
+      rmSync(archive, { force: true })
+      try { rmSync(`${archive}.part`, { force: true }) } catch {}
+    }
+  }
   if (!existsSync(archive)) {
     if (backgroundDownload) return
     backgroundDownload = (async () => {
@@ -818,6 +829,8 @@ async function launchUpdater(tagName, component, localArchive) {
   }
   // 更新会整体替换应用目录：先停掉并等 Harness 退出，释放 resources\node\node.exe
   // 与 resources\harness 里原生插件上的文件锁（before-quit 的 kill 保留为兜底）。
+  // 主动停止时先抑制“Harness 意外退出”弹窗，否则用户会看到一个错误的报错框。
+  suppressHarnessExitError = true
   if (harnessProcess) {
     try { await stopHarness() } catch {}
   }
