@@ -140,6 +140,7 @@
       <button id="restart" type="button">重启 Harness</button>
       <button id="updates" type="button">检查更新</button>
       <button id="dataManage" type="button">数据管理</button>
+      <button id="shortcut" type="button">创建快捷方式</button>
       <button id="about" type="button">关于</button>
       <div id="progress" class="progress" hidden>
         <div id="progressFill" class="progress-fill"></div>
@@ -206,6 +207,9 @@
       })
       document.getElementById('dataManage').addEventListener('click', () => {
         window.deepseekHarnessDesktop.dataManage()
+      })
+      document.getElementById('shortcut').addEventListener('click', () => {
+        window.deepseekHarnessDesktop.createShortcuts()
       })
       document.getElementById('about').addEventListener('click', () => {
         window.deepseekHarnessDesktop.showAbout()

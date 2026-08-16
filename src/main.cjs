@@ -1,7 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHash } = require('node:crypto')
-const { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
+const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
 const { tmpdir } = require('node:os')
@@ -791,6 +791,7 @@ function createTray() {
     { label: '检查更新', click: () => checkForUpdates({ manual: true }) },
     { label: '备份数据', click: () => backupData() },
     { label: '恢复备份', click: () => restoreData() },
+    { label: '创建快捷方式', click: () => createShortcutsDialog() },
     { type: 'separator' },
     { label: '打开数据目录', click: () => shell.openPath(dataRoot) },
     { label: '打开日志目录', click: () => shell.openPath(logsRoot) },
@@ -803,19 +804,132 @@ function createTray() {
 function runCommand(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
     let stderr = ''
+    child.stdout.on('data', chunk => { stdout += chunk })
     child.stderr.on('data', chunk => { stderr += chunk })
     child.once('error', reject)
     child.once('exit', code => {
-      if (code === 0) return resolve()
+      if (code === 0) return resolve({ stdout, stderr })
       reject(new Error(`${command} ${args.join(' ')} 执行失败（exit ${code}）：${stderr.trim().slice(0, 300)}`))
     })
   })
 }
 
 // Windows 10 1803+ 自带 bsdtar，项目打包流程已依赖 tar 生成 zip。
+// 备份范围：模型设置（dsh-home）与工作区（workspace），不含日志、更新包与应用自身设置。
+const BACKUP_ITEMS = ['dsh-home', 'workspace']
+
 async function createDataBackup(targetZip) {
-  await runCommand('tar.exe', ['-a', '-cf', targetZip, '--exclude=updates', '-C', dataRoot, '.'])
+  const items = BACKUP_ITEMS.filter(item => existsSync(join(dataRoot, item)))
+  if (items.length === 0) {
+    throw new Error('data/ 中缺少 dsh-home 或 workspace，没有可备份的数据')
+  }
+  await runCommand('tar.exe', ['-a', '-cf', targetZip, '-C', dataRoot, ...items])
+}
+
+async function createShortcuts(mode) {
+  const script = [
+    'param($Mode, $Target, $WorkDir)',
+    '$ws = New-Object -ComObject WScript.Shell',
+    'function New-Lnk($folder) {',
+    "  $lnk = Join-Path $folder 'DshPort.lnk'",
+    '  $s = $ws.CreateShortcut($lnk)',
+    '  $s.TargetPath = $Target',
+    '  $s.WorkingDirectory = $WorkDir',
+    '  $s.IconLocation = "$Target,0"',
+    "  $s.Description = 'DshPort'",
+    '  $s.Save()',
+    '  Write-Output ("CREATED " + $lnk)',
+    '}',
+    "if ($Mode -eq 'desktop' -or $Mode -eq 'both') { New-Lnk ([Environment]::GetFolderPath('Desktop')) }",
+    "if ($Mode -eq 'startmenu' -or $Mode -eq 'both') { New-Lnk ([Environment]::GetFolderPath('Programs')) }",
+  ].join('\n')
+  const scriptFile = join(app.getPath('temp'), 'dshport-create-shortcut.ps1')
+  writeFileSync(scriptFile, script)
+  try {
+    const { stdout } = await runCommand('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptFile,
+      '-Mode', mode, '-Target', process.execPath, '-WorkDir', portableRoot,
+    ])
+    return (stdout.match(/^CREATED (.+)$/gmu) || []).map(line => line.replace(/^CREATED /u, '').trim())
+  } finally {
+    rmSync(scriptFile, { force: true })
+  }
+}
+
+async function createShortcutsDialog() {
+  if (!isPackaged) {
+    await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '创建快捷方式仅在打包版（便携版）应用中可用。' })
+    return
+  }
+  const answer = await dialog.showMessageBox({
+    type: 'question',
+    title: APP_NAME,
+    message: '创建快捷方式',
+    detail: [
+      '在桌面和/或开始菜单创建 DshPort 启动快捷方式。',
+      `程序位置：${process.execPath}`,
+      '提示：移动 DshPort 文件夹后需重新创建。',
+    ].join('\n'),
+    buttons: ['桌面', '开始菜单', '桌面和开始菜单', '取消'],
+    defaultId: 2,
+    cancelId: 3,
+  })
+  const mode = ['desktop', 'startmenu', 'both'][answer.response]
+  if (!mode) return
+  sendStatus('正在创建快捷方式…', 'info')
+  try {
+    const created = await createShortcuts(mode)
+    sendStatus(`已创建快捷方式：${created.length} 个`, 'ok')
+    await dialog.showMessageBox({
+      type: 'info',
+      title: APP_NAME,
+      message: '快捷方式已创建。',
+      detail: created.length ? created.join('\n') : '未创建任何快捷方式。',
+      buttons: ['确定'],
+    })
+  } catch (error) {
+    console.warn('Create shortcuts failed:', error.message)
+    sendStatus('创建快捷方式失败', 'warn')
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: '创建快捷方式失败。',
+      detail: error.message,
+    })
+  }
+}
+
+// 首次启动只询问一次是否创建桌面快捷方式（记录在 data/settings.json）。
+function maybePromptShortcut() {
+  if (!isPackaged) return
+  const settings = readSettings()
+  if (settings.shortcutPrompted === true) return
+  writeSettings({ ...settings, shortcutPrompted: true })
+  dialog.showMessageBox({
+    type: 'question',
+    title: APP_NAME,
+    message: '是否创建桌面快捷方式？',
+    detail: '创建后双击桌面图标即可启动 DshPort（仅首次启动询问一次）。',
+    buttons: ['创建桌面快捷方式', '暂不创建'],
+    defaultId: 0,
+    cancelId: 1,
+  }).then(async answer => {
+    if (answer.response !== 0) return
+    sendStatus('正在创建快捷方式…', 'info')
+    try {
+      const created = await createShortcuts('desktop')
+      sendStatus('已创建桌面快捷方式', 'ok')
+      if (created.length === 0) {
+        await dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '未找到桌面目录，未创建快捷方式。' })
+      }
+    } catch (error) {
+      console.warn('Create desktop shortcut failed:', error.message)
+      sendStatus('创建快捷方式失败', 'warn')
+      await dialog.showMessageBox({ type: 'warning', title: APP_NAME, message: '创建桌面快捷方式失败。', detail: error.message })
+    }
+  })
 }
 
 async function backupData() {
@@ -865,8 +979,9 @@ async function restoreData() {
   const answer = await dialog.showMessageBox({
     type: 'warning',
     title: APP_NAME,
-    message: '恢复备份将覆盖当前 data/ 中的会话、配置和工作区数据。',
+    message: '恢复备份将覆盖当前工作区与模型设置（dsh-home）。',
     detail: [
+      '日志与更新文件不会被覆盖。',
       '恢复期间 Harness 会短暂停止，完成后自动重启。',
       `备份文件：${archive}`,
     ].join('\n'),
@@ -878,21 +993,31 @@ async function restoreData() {
   restoreInProgress = true
   suppressHarnessExitError = true
   sendStatus('正在恢复数据备份…', 'info')
-  const backupDir = `${dataRoot}.backup-${Date.now()}`
+  const temp = join(app.getPath('temp'), `dsh-restore-${Date.now()}`)
   try {
     await stopHarness()
     // 给杀毒软件/文件系统一点时间释放句柄。
     await new Promise(resolve => setTimeout(resolve, 300))
-    if (existsSync(dataRoot)) renameSync(dataRoot, backupDir)
-    mkdirSync(dataRoot, { recursive: true })
-    try {
-      await runCommand('tar.exe', ['-xf', archive, '-C', dataRoot])
-    } catch (extractError) {
-      rmSync(dataRoot, { recursive: true, force: true })
-      if (existsSync(backupDir)) renameSync(backupDir, dataRoot)
-      throw extractError
+    mkdirSync(temp, { recursive: true })
+    await runCommand('tar.exe', ['-xf', archive, '-C', temp])
+    const present = BACKUP_ITEMS.filter(item => existsSync(join(temp, item)))
+    if (present.length === 0) {
+      throw new Error('备份文件格式不正确：未找到 dsh-home 或 workspace')
     }
-    rmSync(backupDir, { recursive: true, force: true })
+    // 覆盖式合并：只替换备份中包含的目录，日志/更新/设置保持原样。
+    for (const item of present) {
+      const target = join(dataRoot, item)
+      const backup = `${target}.bak-${Date.now()}`
+      if (existsSync(target)) renameSync(target, backup)
+      try {
+        cpSync(join(temp, item), target, { recursive: true })
+      } catch (copyError) {
+        rmSync(target, { recursive: true, force: true })
+        if (existsSync(backup)) renameSync(backup, target)
+        throw copyError
+      }
+      rmSync(backup, { recursive: true, force: true })
+    }
     ensureDirectories()
     const url = await startHarness()
     sendUrlToWindow(url)
@@ -901,7 +1026,7 @@ async function restoreData() {
       type: 'info',
       title: APP_NAME,
       message: '数据备份恢复完成。',
-      detail: 'Harness 已重新启动。',
+      detail: '工作区与模型设置已恢复，Harness 已重新启动。',
     })
   } catch (error) {
     console.warn('Data restore failed:', error.message)
@@ -922,6 +1047,7 @@ async function restoreData() {
   } finally {
     restoreInProgress = false
     suppressHarnessExitError = false
+    try { rmSync(temp, { recursive: true, force: true }) } catch {}
   }
 }
 
@@ -935,6 +1061,8 @@ async function start() {
   checkForUpdates().catch(error => console.warn('Update check failed:', error.message))
   const url = await startHarness()
   sendUrlToWindow(url)
+  // 首次启动延迟询问是否创建桌面快捷方式。
+  setTimeout(maybePromptShortcut, 5000)
 }
 
 const gotLock = app.requestSingleInstanceLock()
@@ -972,6 +1100,7 @@ ipcMain.handle('check-for-updates', () => checkForUpdates({ manual: true }))
 ipcMain.handle('show-about', () => showAbout())
 ipcMain.handle('backup-data', () => backupData())
 ipcMain.handle('restore-data', () => restoreData())
+ipcMain.handle('create-shortcuts', () => createShortcutsDialog())
 ipcMain.handle('data-manage', async () => {
   const answer = await dialog.showMessageBox({
     type: 'info',
@@ -979,7 +1108,7 @@ ipcMain.handle('data-manage', async () => {
     message: '数据管理',
     detail: [
       `数据目录：${dataRoot}`,
-      '备份文件不包含 updates/ 目录。',
+      '备份仅包含工作区与模型设置（dsh-home），不含日志、更新包。',
     ].join('\n'),
     buttons: ['备份数据', '恢复备份', '取消'],
     defaultId: 0,

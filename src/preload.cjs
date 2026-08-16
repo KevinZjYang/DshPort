@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('deepseekHarnessDesktop', {
   dataManage: () => ipcRenderer.invoke('data-manage'),
   backupData: () => ipcRenderer.invoke('backup-data'),
   restoreData: () => ipcRenderer.invoke('restore-data'),
+  createShortcuts: () => ipcRenderer.invoke('create-shortcuts'),
   onHarnessUrl: callback => {
     const listener = (_event, url) => callback(url)
     ipcRenderer.on('harness-url', listener)
