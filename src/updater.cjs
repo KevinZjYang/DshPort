@@ -317,11 +317,14 @@ function updaterDir() {
 
 function startProgressWindow(file) {
   const script = join(updaterDir(), 'update-progress.ps1')
+  // 不用 detached：进度窗口只需在更新器存活期间显示（更新器从启动到 COMPLETE 一直
+  // 活着）；DETACHED_PROCESS 会让 powershell 的 WinForms 窗口在部分机器上不显示。
+  // windowsHide 隐藏 powershell 的控制台窗口，只显示表单。
   const child = spawn('powershell.exe', [
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
     '-StatusFile', file,
     '-UpdaterPid', String(process.pid),
-  ], { detached: true, stdio: 'ignore' })
+  ], { stdio: 'ignore', windowsHide: true })
   // 进度窗口是尽力而为，失败不应中断更新；但要把失败原因记进日志。
   child.once('error', error => {
     try { console.warn(`Progress window failed to start: ${error.message}`) } catch {}
