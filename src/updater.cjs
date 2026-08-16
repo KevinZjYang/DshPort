@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto')
-const { createWriteStream, mkdirSync } = require('node:fs')
-const { access, appendFile, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } = require('node:fs/promises')
+const { createReadStream, createWriteStream, mkdirSync, writeFileSync } = require('node:fs')
+const { access, appendFile, cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } = require('node:fs/promises')
 const { tmpdir } = require('node:os')
 const { dirname, join } = require('node:path')
 const { request } = require('node:https')
@@ -140,19 +140,83 @@ async function makeTemp() {
   }
 }
 
-async function extractZip(archive, target) {
+async function extractZipProgress(archive, target, onProgress) {
   await mkdir(target, { recursive: true })
   const tar = process.platform === 'win32' ? 'tar.exe' : 'tar'
-  await new Promise((resolveRun, reject) => {
-    const child = spawn(tar, ['-xf', archive, '-C', target], { windowsHide: true })
+  const countEntries = () => new Promise((resolveRun, reject) => {
+    const child = spawn(tar, ['-tf', archive], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let count = 0
+    child.stdout.on('data', chunk => { count += chunk.toString().split(/\r?\n/u).length - 1 })
     child.once('error', reject)
-    child.once('exit', code => code === 0 ? resolveRun() : reject(new Error(`archive extraction failed: ${code}`)))
+    child.once('exit', code => code === 0 ? resolveRun(count) : reject(new Error(`archive list failed: ${code}`)))
+  })
+  const total = await countEntries()
+  await new Promise((resolveRun, reject) => {
+    const child = spawn(tar, ['-xf', archive, '-C', target], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    let done = 0
+    let lastReport = 0
+    child.stdout.on('data', chunk => {
+      done += chunk.toString().split(/\r?\n/u).length - 1
+      const now = Date.now()
+      if (now - lastReport > 250 && total > 0) {
+        lastReport = now
+        onProgress(Math.min(done, total), total)
+      }
+    })
+    child.once('error', reject)
+    child.once('exit', code => code === 0 ? onProgress(total, total) : reject(new Error(`archive extraction failed: ${code}`)))
   })
 }
 
 async function singleExtractedRoot(extractRoot) {
   const entries = await (await import('node:fs/promises')).readdir(extractRoot, { withFileTypes: true })
   return entries.length === 1 && entries[0].isDirectory() ? join(extractRoot, entries[0].name) : extractRoot
+}
+
+async function treeBytes(root) {
+  let total = 0
+  async function walk(dir) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) await walk(path)
+      else if (entry.isFile()) total += (await stat(path)).size
+    }
+  }
+  await walk(root)
+  return total
+}
+
+// 逐字节拷贝并上报进度（fs.cp 不支持进度回调）。
+async function copyTreeProgress(source, target, onProgress) {
+  const total = await treeBytes(source)
+  let copied = 0
+  let lastReport = 0
+  async function walk(src, dst) {
+    await mkdir(dst, { recursive: true })
+    for (const entry of await readdir(src, { withFileTypes: true })) {
+      const s = join(src, entry.name)
+      const d = join(dst, entry.name)
+      if (entry.isDirectory()) await walk(s, d)
+      else if (entry.isFile()) {
+        await new Promise((resolveRun, reject) => {
+          const rs = createReadStream(s)
+          const ws = createWriteStream(d)
+          rs.on('data', chunk => { copied += chunk.length })
+          rs.on('error', reject)
+          ws.on('error', reject)
+          ws.on('close', resolveRun)
+          rs.pipe(ws)
+        })
+        const now = Date.now()
+        if (now - lastReport > 250) {
+          lastReport = now
+          onProgress(copied, total)
+        }
+      }
+    }
+  }
+  await walk(source, target)
+  onProgress(total, total)
 }
 
 // rename 可能因瞬时占用（杀软扫描、残留子进程）失败，重试几次再放弃。
@@ -201,7 +265,11 @@ async function swapPortableApp(sourceRoot) {
   if (await exists(dataPath)) await retryRename(dataPath, dataHold)
   if (await exists(appRoot)) await retryRename(appRoot, backup)
   try {
-    await cp(sourceRoot, appRoot, { recursive: true })
+    await reportProgress('正在替换文件… 0%')
+    await copyTreeProgress(sourceRoot, appRoot, (copied, total) => {
+      const pct = total > 0 ? Math.floor((copied / total) * 100) : -1
+      reportProgress(pct >= 0 ? `正在替换文件… ${pct}%` : '正在替换文件…')
+    })
   } catch (error) {
     // 回滚：残缺的新目录改名靠边（绝不原地删除，避免应用目录进入残缺态），
     // 再恢复旧应用与 data。
@@ -342,14 +410,16 @@ function updaterDir() {
 
 function startProgressWindow(file) {
   const script = join(updaterDir(), 'update-progress.ps1')
-  // 实测：detached（DETACHED_PROCESS）会让 powershell 直接退出；windowsHide
-  // （CREATE_NO_WINDOW）会让 WinForms 窗口不显示。只能用普通 spawn，
-  // 控制台窗口由 ps1 自己隐藏。
-  const child = spawn('powershell.exe', [
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
-    '-StatusFile', file,
-    '-UpdaterPid', String(process.pid),
-  ], { stdio: 'ignore' })
+  // 通过 wscript + vbs 以隐藏窗口样式(0)启动 powershell，从源头避免控制台窗口出现：
+  // 实测 node 直接 spawn powershell 时，windowsHide 会吞掉 WinForms 窗口，
+  // detached 会让 powershell 直接退出，而普通 spawn 会带出一个可见控制台窗口。
+  const vbs = join(updateTemp, 'launch-progress.vbs')
+  const quote = value => value.replace(/"/gu, '""')
+  writeFileSync(vbs, [
+    'Set shell = CreateObject("WScript.Shell")',
+    `shell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""${quote(script)}"" -StatusFile ""${quote(file)}"" -UpdaterPid ${process.pid}", 0, False`,
+  ].join('\r\n'))
+  const child = spawn('wscript.exe', [vbs], { stdio: 'ignore' })
   // 进度窗口是尽力而为，失败不应中断更新；但要把失败原因记进日志。
   child.once('error', error => {
     try { console.warn(`Progress window failed to start: ${error.message}`) } catch {}
@@ -377,9 +447,12 @@ async function updateHarnessRuntime(release, temp) {
   })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
-  await reportProgress('正在解压更新包…')
+  await reportProgress('正在解压更新包… 0%')
   const extractRoot = join(temp, 'harness')
-  await extractZip(archive, extractRoot)
+  await extractZipProgress(archive, extractRoot, (done, total) => {
+    const pct = total > 0 ? Math.floor((done / total) * 100) : -1
+    reportProgress(pct >= 0 ? `正在解压更新包… ${pct}%` : '正在解压更新包…')
+  })
   const appRoot = dirname(executablePath)
   const harnessRoot = join(appRoot, 'resources', 'harness')
   await reportProgress('正在替换文件…')
@@ -397,20 +470,24 @@ async function updateWholePortable(release, temp) {
   })
   await reportProgress('正在校验文件…')
   await verifyChecksum(release, asset, archive, temp)
-  await reportProgress('正在解压更新包…')
+  await reportProgress('正在解压更新包… 0%')
   const extractRoot = join(temp, 'portable')
-  await extractZip(archive, extractRoot)
+  await extractZipProgress(archive, extractRoot, (done, total) => {
+    const pct = total > 0 ? Math.floor((done / total) * 100) : -1
+    reportProgress(pct >= 0 ? `正在解压更新包… ${pct}%` : '正在解压更新包…')
+  })
   const sourceRoot = await singleExtractedRoot(extractRoot)
-  await reportProgress('正在替换文件…')
   await swapPortableApp(sourceRoot)
 }
 
 async function installFromLocal(archive, temp) {
   const appRoot = dirname(executablePath)
   const extractRoot = join(temp, 'local')
-  await reportProgress('正在解压更新包…')
-  await extractZip(archive, extractRoot)
-  await reportProgress('正在替换文件…')
+  await reportProgress('正在解压更新包… 0%')
+  await extractZipProgress(archive, extractRoot, (done, total) => {
+    const pct = total > 0 ? Math.floor((done / total) * 100) : -1
+    reportProgress(pct >= 0 ? `正在解压更新包… ${pct}%` : '正在解压更新包…')
+  })
   if (component === 'harness') {
     const harnessRoot = join(appRoot, 'resources', 'harness')
     await replaceDirectory(harnessRoot, await singleExtractedRoot(extractRoot))
