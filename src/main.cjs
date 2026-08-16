@@ -1,12 +1,13 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, shell, Tray } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
-const { createHash } = require('node:crypto')
+const { createHash, randomUUID } = require('node:crypto')
 const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
 const { tmpdir } = require('node:os')
 const { basename, dirname, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
+const { createTaskTracker } = require('./task-tracker.cjs')
 
 const APP_NAME = 'DshPort'
 const DEFAULT_PORT = 3080
@@ -48,6 +49,8 @@ let windowLoaded = false
 let backgroundDownload = null
 let installPromptOpen = false
 let lastProgressLabel = ''
+let taskNotifier = null
+const TASK_POLL_INTERVAL_MS = 2000
 
 function ensureDirectories() {
   for (const path of [dataRoot, dshHome, workspace, logsRoot, updatesDir]) mkdirSync(path, { recursive: true })
@@ -167,8 +170,10 @@ async function restartHarness() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   suppressHarnessExitError = true
   try {
+    stopTaskNotifier()
     await stopHarness()
     const url = await startHarness()
+    startTaskNotifier(url)
     sendUrlToWindow(url)
     return url
   } catch (error) {
@@ -190,6 +195,76 @@ function sendUrlToWindow(url) {
 function sendStatus(text, kind = 'info', percent = undefined) {
   if (!mainWindow || mainWindow.isDestroyed()) return
   mainWindow.webContents.send('app-status', { text, kind, percent })
+}
+
+// 任务完成通知：轮询 Harness 的 session.list RPC，跟踪顶层会话 running 翻转，
+// 任务结束时弹出 Windows 通知（窗口在前台时静默，避免打扰）。
+async function pollSessionList(url) {
+  try {
+    const response = await fetch(`${url}/api/session.list`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type: 'client-request', rpcId: randomUUID(), method: 'session.list', payload: {} }),
+    })
+    if (!response.ok) return []
+    const envelope = await response.json()
+    if (envelope?.type !== 'server-response' || envelope?.result?.ok !== true) return []
+    const items = envelope.result.value?.items
+    return Array.isArray(items) ? items : []
+  } catch (error) {
+    console.warn('Task completion poll failed:', error.message)
+    return []
+  }
+}
+
+function notifyTaskCompleted({ sessionId, title }) {
+  const settings = readSettings()
+  if (settings.taskNotifications === false) return
+  if (!tray) return
+  // 用户正盯着界面时不打扰。
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return
+  const body = `任务已结束：${title || sessionId}`
+  if (Notification.isSupported()) {
+    try {
+      const notification = new Notification({
+        title: APP_NAME,
+        body,
+        icon: iconPath,
+      })
+      notification.on('click', () => showMainWindow())
+      notification.show()
+      return
+    } catch (error) {
+      console.warn('Windows notification failed, falling back to tray balloon:', error.message)
+    }
+  }
+  try {
+    tray.displayBalloon({ iconType: 'info', title: APP_NAME, content: body })
+  } catch {}
+}
+
+function startTaskNotifier(url) {
+  stopTaskNotifier()
+  const tracker = createTaskTracker()
+  let polling = false
+  const timer = setInterval(async () => {
+    if (polling) return
+    polling = true
+    try {
+      const items = await pollSessionList(url)
+      for (const completed of tracker.ingest(items)) notifyTaskCompleted(completed)
+    } finally {
+      polling = false
+    }
+  }, TASK_POLL_INTERVAL_MS)
+  timer.unref?.()
+  taskNotifier = { tracker, timer, url }
+}
+
+function stopTaskNotifier() {
+  if (!taskNotifier) return
+  clearInterval(taskNotifier.timer)
+  taskNotifier = null
 }
 
 function createWindow() {
@@ -790,6 +865,13 @@ function createTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示主窗口', click: showMainWindow },
     { type: 'separator' },
+    {
+      label: '任务完成通知',
+      type: 'checkbox',
+      checked: readSettings().taskNotifications !== false,
+      click: item => writeSettings({ ...readSettings(), taskNotifications: item.checked }),
+    },
+    { type: 'separator' },
     { label: '重启 Harness', click: () => restartHarness() },
     { label: '检查更新', click: () => checkForUpdates({ manual: true }) },
     { label: '备份数据', click: () => backupData() },
@@ -999,6 +1081,7 @@ async function restoreData() {
   sendStatus('正在恢复数据备份…', 'info')
   const temp = join(app.getPath('temp'), `dsh-restore-${Date.now()}`)
   try {
+    stopTaskNotifier()
     await stopHarness()
     // 给杀毒软件/文件系统一点时间释放句柄。
     await new Promise(resolve => setTimeout(resolve, 300))
@@ -1024,6 +1107,7 @@ async function restoreData() {
     }
     ensureDirectories()
     const url = await startHarness()
+    startTaskNotifier(url)
     sendUrlToWindow(url)
     sendStatus('数据备份恢复完成', 'ok')
     await dialog.showMessageBox({
@@ -1045,6 +1129,7 @@ async function restoreData() {
     try {
       if (!harnessProcess) {
         const url = await startHarness()
+        startTaskNotifier(url)
         sendUrlToWindow(url)
       }
     } catch {}
@@ -1064,6 +1149,7 @@ async function start() {
   // Update check runs in the background and must not delay harness startup.
   checkForUpdates().catch(error => console.warn('Update check failed:', error.message))
   const url = await startHarness()
+  startTaskNotifier(url)
   sendUrlToWindow(url)
   // 首次启动延迟询问是否创建桌面快捷方式。
   setTimeout(maybePromptShortcut, 5000)
@@ -1088,6 +1174,7 @@ if (!gotLock) {
 app.on('before-quit', () => {
   shuttingDown = true
   quitting = true
+  stopTaskNotifier()
   if (harnessProcess && !harnessProcess.killed) {
     harnessProcess.kill()
     harnessProcess = undefined
