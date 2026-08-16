@@ -164,7 +164,11 @@ async function extractZipProgress(archive, target, onProgress) {
       }
     })
     child.once('error', reject)
-    child.once('exit', code => code === 0 ? onProgress(total, total) : reject(new Error(`archive extraction failed: ${code}`)))
+    child.once('exit', code => {
+      if (code !== 0) return reject(new Error(`archive extraction failed: ${code}`))
+      onProgress(total, total)
+      resolveRun()
+    })
   })
 }
 
