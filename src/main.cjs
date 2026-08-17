@@ -1,12 +1,23 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHash, randomUUID } = require('node:crypto')
-const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
+const { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
 const { tmpdir } = require('node:os')
 const { basename, dirname, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
+const {
+  MANIFEST_NAME,
+  applyRestorePlan,
+  availableCategoryIds,
+  buildManifest,
+  categoryById,
+  legacyCategoriesFromEntries,
+  parseManifest,
+  restoreSources,
+  stageBackup,
+} = require('./backup-categories.cjs')
 const { createTaskTracker } = require('./task-tracker.cjs')
 const { frameNotification, frameResolution } = require('./interaction-frames.cjs')
 
@@ -1024,6 +1035,13 @@ function quitApp() {
   })
 }
 
+// 重启应用：先登记 relaunch 再退出；退出流程（before-quit）会顺带停止 Harness。
+function restartApp() {
+  if (quitting) return
+  app.relaunch()
+  app.quit()
+}
+
 function createTray() {
   if (tray) return
   const trayIcon = existsSync(trayIconPath) ? trayIconPath : iconPath
@@ -1047,13 +1065,14 @@ function createTray() {
     { type: 'separator' },
     { label: '重启 Harness', click: () => restartHarness() },
     { label: '检查更新', click: () => checkForUpdates({ manual: true }) },
-    { label: '备份数据', click: () => backupData() },
-    { label: '恢复备份', click: () => restoreData() },
+    { label: '备份数据…', click: () => backupData() },
+    { label: '恢复备份…', click: () => restoreData() },
     { label: '创建快捷方式', click: () => createShortcutsDialog() },
     { type: 'separator' },
     { label: '打开数据目录', click: () => shell.openPath(dataRoot) },
     { label: '打开日志目录', click: () => shell.openPath(logsRoot) },
     { type: 'separator' },
+    { label: '重启', click: restartApp },
     { label: '退出', click: quitApp },
   ]))
   tray.on('double-click', showMainWindow)
@@ -1075,16 +1094,109 @@ function runCommand(command, args) {
 }
 
 // Windows 10 1803+ 自带 bsdtar，项目打包流程已依赖 tar 生成 zip。
-// 备份范围：模型设置（dsh-home）与工作区（workspace），不含日志、更新包、
-// 应用自身设置，以及可重新生成的依赖（node_modules）。
-const BACKUP_ITEMS = ['dsh-home', 'workspace']
-
-async function createDataBackup(targetZip) {
-  const items = BACKUP_ITEMS.filter(item => existsSync(join(dataRoot, item)))
-  if (items.length === 0) {
-    throw new Error('data/ 中缺少 dsh-home 或 workspace，没有可备份的数据')
+// 备份按内容类别组织（见 backup-categories.cjs）：工作区记录、Harness 设置、软件设置；
+// 不含日志、更新包以及可重新生成的依赖（node_modules）。
+async function createDataBackup(targetZip, categories) {
+  const staging = mkdtempSync(join(tmpdir(), 'dsh-backup-'))
+  try {
+    stageBackup(dataRoot, staging, categories)
+    const manifest = buildManifest({
+      appVersion: getVersion(),
+      harnessVersion: getHarnessVersion(),
+      categories,
+    })
+    writeFileSync(join(staging, MANIFEST_NAME), JSON.stringify(manifest, null, 2))
+    await runCommand('tar.exe', ['-a', '-cf', targetZip, '-C', staging, '.'])
+  } finally {
+    rmSync(staging, { recursive: true, force: true })
   }
-  await runCommand('tar.exe', ['-a', '-cf', targetZip, '--exclude=node_modules', '-C', dataRoot, ...items])
+}
+
+// —— 备份/恢复类别选择窗口与统计 ——
+
+let pickerPending = null
+
+async function openCategoryPicker({ mode, title, detail, categories }) {
+  if (pickerPending) return { canceled: true, selected: [] }
+  return new Promise(resolve => {
+    const parent = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : undefined
+    pickerPending = { resolve, options: { mode, title, detail, categories } }
+    const win = new BrowserWindow({
+      width: 560,
+      height: 620,
+      resizable: false,
+      minimizable: false,
+      maximizable: false,
+      parent,
+      modal: Boolean(parent),
+      title,
+      show: false,
+      backgroundColor: '#f7f8fa',
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: join(__dirname, 'picker-preload.cjs'),
+      },
+    })
+    win.once('ready-to-show', () => win.show())
+    win.on('closed', () => {
+      const pending = pickerPending
+      pickerPending = null
+      if (pending) pending.resolve({ canceled: true, selected: [] })
+    })
+    win.loadFile(join(__dirname, 'picker.html'))
+  })
+}
+
+function directorySize(dir, { exclude = [] } = {}) {
+  let total = 0
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || exclude.includes(entry.name)) continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) total += directorySize(full, { exclude })
+      else if (entry.isFile()) {
+        try { total += statSync(full).size } catch {}
+      }
+    }
+  } catch {}
+  return total
+}
+
+function fileSize(path) {
+  try { return existsSync(path) ? statSync(path).size : 0 } catch { return 0 }
+}
+
+function computeBackupCategorySizes() {
+  return {
+    'workspace-records':
+      directorySize(join(dshHome, 'sessions')) +
+      directorySize(join(dshHome, 'storages')) +
+      directorySize(workspace),
+    'harness-settings': directorySize(dshHome, { exclude: ['sessions', 'storages'] }),
+    'app-settings': fileSize(settingsFile),
+  }
+}
+
+function restoreCategorySize(tempRoot, id, legacy) {
+  const plan = restoreSources({ tempRoot, dataRoot: tempRoot, categories: [id], legacy })
+  let total = 0
+  for (const item of plan) {
+    if (item.kind === 'file') total += fileSize(item.from)
+    else total += directorySize(item.from)
+  }
+  return total
+}
+
+// 软件设置恢复后，托盘菜单里的开关状态需要按新 settings.json 重建。
+function refreshTray() {
+  try {
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
+  } catch {}
+  createTray()
 }
 
 async function createShortcuts(mode) {
@@ -1192,6 +1304,34 @@ function maybePromptShortcut() {
 }
 
 async function backupData() {
+  // 备份按类别选择（默认全选）：工作区记录、Harness 设置、软件设置。
+  const ids = availableCategoryIds(dataRoot)
+  if (ids.length === 0) {
+    await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: '没有可备份的数据。',
+      detail: `数据目录：${dataRoot}`,
+    })
+    return
+  }
+  const sizes = computeBackupCategorySizes()
+  const categories = ids.map(id => {
+    const def = categoryById(id)
+    return { id, label: def.label, description: def.description, size: sizes[id] || 0, checked: true }
+  })
+  const pick = await openCategoryPicker({
+    mode: 'backup',
+    title: '备份数据 — 选择内容',
+    detail: [
+      '选择要备份的内容（可多选，默认全选）。',
+      '提示：备份体积主要来自工作区记录（会话历史），可按需取消勾选来控制备份文件大小。',
+      '注意：Harness 设置中包含 API 凭据（.credentials.yaml），请妥善保管备份文件。',
+    ].join('\n'),
+    categories,
+  })
+  if (pick.canceled || pick.selected.length === 0) return
+  const selected = pick.selected
   const stamp = new Date().toISOString().replace(/[:.]/gu, '-').slice(0, 19).replace('T', '-')
   const result = await dialog.showSaveDialog({
     title: '备份数据',
@@ -1202,13 +1342,18 @@ async function backupData() {
   const target = result.filePath
   sendStatus('正在备份数据…', 'info')
   try {
-    await createDataBackup(target)
+    await createDataBackup(target, selected)
     sendStatus('数据备份完成', 'ok')
+    const labels = selected.map(id => categoryById(id).label).join('、')
     const answer = await dialog.showMessageBox({
       type: 'info',
       title: APP_NAME,
       message: '数据备份完成。',
-      detail: target,
+      detail: [
+        `包含内容：${labels}`,
+        '注意：备份包含 API 凭据（.credentials.yaml），请妥善保管备份文件。',
+        target,
+      ].join('\n'),
       buttons: ['打开所在文件夹', '确定'],
       defaultId: 1,
       cancelId: 1,
@@ -1235,59 +1380,88 @@ async function restoreData() {
   })
   if (result.canceled || result.filePaths.length === 0) return
   const archive = result.filePaths[0]
-  const answer = await dialog.showMessageBox({
-    type: 'warning',
-    title: APP_NAME,
-    message: '恢复备份将覆盖当前工作区与模型设置（dsh-home）。',
-    detail: [
-      '日志与更新文件不会被覆盖。',
-      '恢复期间 Harness 会短暂停止，完成后自动重启。',
-      `备份文件：${archive}`,
-    ].join('\n'),
-    buttons: ['取消', '继续恢复'],
-    defaultId: 0,
-    cancelId: 0,
-  })
-  if (answer.response !== 1) return
-  restoreInProgress = true
-  suppressHarnessExitError = true
-  sendStatus('正在恢复数据备份…', 'info')
   const temp = join(app.getPath('temp'), `dsh-restore-${Date.now()}`)
   try {
-    stopTaskNotifier()
-    await stopHarness()
-    // 给杀毒软件/文件系统一点时间释放句柄。
-    await new Promise(resolve => setTimeout(resolve, 300))
     mkdirSync(temp, { recursive: true })
     await runCommand('tar.exe', ['-xf', archive, '-C', temp])
-    const present = BACKUP_ITEMS.filter(item => existsSync(join(temp, item)))
-    if (present.length === 0) {
-      throw new Error('备份文件格式不正确：未找到 dsh-home 或 workspace')
+    // 识别备份格式：优先读清单；旧版备份（无清单）按顶层条目推断。
+    const manifestText = existsSync(join(temp, MANIFEST_NAME))
+      ? readFileSync(join(temp, MANIFEST_NAME), 'utf8')
+      : null
+    const manifest = manifestText ? parseManifest(manifestText) : null
+    const legacy = !manifest
+    const categories = manifest
+      ? manifest.categories
+      : legacyCategoriesFromEntries(readdirSync(temp).filter(name => name !== MANIFEST_NAME))
+    if (categories.length === 0) {
+      throw new Error('备份文件格式不正确：未找到可恢复的内容（工作区记录 / Harness 设置 / 软件设置）')
     }
-    // 覆盖式合并：只替换备份中包含的目录，日志/更新/设置保持原样。
-    for (const item of present) {
-      const target = join(dataRoot, item)
-      const backup = `${target}.bak-${Date.now()}`
-      if (existsSync(target)) renameSync(target, backup)
-      try {
-        cpSync(join(temp, item), target, { recursive: true })
-      } catch (copyError) {
-        rmSync(target, { recursive: true, force: true })
-        if (existsSync(backup)) renameSync(backup, target)
-        throw copyError
-      }
-      rmSync(backup, { recursive: true, force: true })
+    const infoLines = []
+    if (manifest) {
+      if (manifest.createdAt) infoLines.push(`备份时间：${new Date(manifest.createdAt).toLocaleString()}`)
+      if (manifest.appVersion) infoLines.push(`DshPort 版本：${manifest.appVersion}`)
+      if (manifest.harnessVersion) infoLines.push(`Harness 版本：${manifest.harnessVersion}`)
+    } else {
+      infoLines.push('旧版备份（无内容清单，自动识别类别）')
     }
+    const pick = await openCategoryPicker({
+      mode: 'restore',
+      title: '恢复数据备份 — 选择内容',
+      detail: [
+        '选择要恢复的内容（可多选）。恢复将覆盖当前对应数据。',
+        ...infoLines,
+      ].join('\n'),
+      categories: categories.map(id => {
+        const def = categoryById(id)
+        return { id, label: def.label, description: def.description, size: restoreCategorySize(temp, id, legacy) }
+      }),
+    })
+    if (pick.canceled || pick.selected.length === 0) return
+    const selected = pick.selected
+    const answer = await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: '恢复备份将覆盖所选内容对应的当前数据。',
+      detail: [
+        `将恢复：${selected.map(id => categoryById(id).label).join('、')}`,
+        '日志与更新文件不会被覆盖。',
+        '恢复期间 Harness 会短暂停止（如需），完成后自动重启。',
+        `备份文件：${archive}`,
+      ].join('\n'),
+      buttons: ['取消', '继续恢复'],
+      defaultId: 0,
+      cancelId: 0,
+    })
+    if (answer.response !== 1) return
+    restoreInProgress = true
+    suppressHarnessExitError = true
+    sendStatus('正在恢复数据备份…', 'info')
+    stopTaskNotifier()
+    // 工作区记录 / Harness 设置可能正被 Harness 占用，先停掉再恢复。
+    const needsRestart = selected.some(id => id === 'workspace-records' || id === 'harness-settings')
+    if (needsRestart) {
+      await stopHarness()
+      // 给杀毒软件/文件系统一点时间释放句柄。
+      await new Promise(resolve => setTimeout(resolve, 300))
+    }
+    const plan = restoreSources({ tempRoot: temp, dataRoot, categories: selected, legacy })
+    if (plan.length === 0) {
+      throw new Error('备份文件中未找到所选内容')
+    }
+    const restored = applyRestorePlan(plan)
     ensureDirectories()
-    const url = await startHarness()
-    startTaskNotifier(url)
-    sendUrlToWindow(url)
+    if (needsRestart) {
+      const url = await startHarness()
+      startTaskNotifier(url)
+      sendUrlToWindow(url)
+    }
+    if (restored.includes('app-settings')) refreshTray()
     sendStatus('数据备份恢复完成', 'ok')
     await dialog.showMessageBox({
       type: 'info',
       title: APP_NAME,
       message: '数据备份恢复完成。',
-      detail: '工作区与模型设置已恢复，Harness 已重新启动。',
+      detail: `已恢复：${restored.map(id => categoryById(id).label).join('、')}`,
     })
   } catch (error) {
     console.warn('Data restore failed:', error.message)
@@ -1364,6 +1538,16 @@ ipcMain.handle('check-for-updates', () => checkForUpdates({ manual: true }))
 ipcMain.handle('show-about', () => showAbout())
 ipcMain.handle('backup-data', () => backupData())
 ipcMain.handle('restore-data', () => restoreData())
+ipcMain.handle('picker-get-options', () => (pickerPending && pickerPending.options) || null)
+ipcMain.handle('picker-submit', (_event, result) => {
+  const pending = pickerPending
+  if (!pending) return
+  pickerPending = null
+  pending.resolve({
+    canceled: Boolean(result && result.canceled === true),
+    selected: Array.isArray(result && result.selected) ? result.selected : [],
+  })
+})
 ipcMain.handle('create-shortcuts', () => createShortcutsDialog())
 ipcMain.handle('data-manage', async () => {
   const answer = await dialog.showMessageBox({
@@ -1372,7 +1556,8 @@ ipcMain.handle('data-manage', async () => {
     message: '数据管理',
     detail: [
       `数据目录：${dataRoot}`,
-      '备份仅包含工作区与模型设置（dsh-home），不含日志、更新包。',
+      '备份与恢复均支持按内容类别选择：工作区记录、Harness 设置、软件设置。',
+      '日志与更新文件不会备份。',
     ].join('\n'),
     buttons: ['备份数据', '恢复备份', '取消'],
     defaultId: 0,
