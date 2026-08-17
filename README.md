@@ -4,6 +4,9 @@ DshPort 是 DeepSeek Harness 的 Windows 便携桌面壳。
 
 这个仓库只保存 DshPort 自己的壳源码、构建脚本和 GitHub Actions。上游 DeepSeek Harness 源码不会提交到本仓库；发布时由 GitHub Actions 临时拉取上游源码，构建出可直接运行的便携包并上传到 Release。
 
+<img width="1784" height="1142" alt="QQ20260817-162757" src="https://github.com/user-attachments/assets/b6fc7bfd-396c-4d5d-b3ae-74a66f3270eb" />
+
+
 ## 下载哪个
 
 第一次使用下载：
