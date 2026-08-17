@@ -152,7 +152,7 @@ async function extractZipProgress(archive, target, onProgress) {
   })
   const total = await countEntries()
   await new Promise((resolveRun, reject) => {
-    const child = spawn(tar, ['-xf', archive, '-C', target], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+    const child = spawn(tar, ['-xvf', archive, '-C', target], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
     let done = 0
     let lastReport = 0
     child.stdout.on('data', chunk => {
