@@ -58,7 +58,7 @@ DshPort 启动时会检查 `KevinZjYang/DshPort` 的最新 Release；窗口顶�
 ## 托盘运行
 
 - 点击窗口关闭按钮会把窗口最小化到系统托盘，应用与 Harness 继续在后台运行；点击托盘图标恢复窗口。
-- 托盘右键菜单提供：显示主窗口、任务完成通知、重启 Harness、检查更新、备份/恢复数据、打开数据/日志目录、退出。
+- 托盘右键菜单提供：显示主窗口、任务完成通知、等待用户响应通知、重启 Harness、检查更新、备份/恢复数据、打开数据/日志目录、退出。
 - 从托盘“退出”时会先确认，避免误关导致 Harness 停止。
 
 ## 任务完成通知
@@ -68,6 +68,15 @@ DshPort 启动时会检查 `KevinZjYang/DshPort` 的最新 Release；窗口顶�
 - 实现方式：DshPort 每 2 秒通过 Harness 自带的 `session.list` API 轮询一次会话状态，检测到正在运行的会话结束后即弹出通知（仅顶层会话，子任务完成不打扰）。
 - 开关：托盘菜单中的“任务完成通知”复选框（默认开启，状态记录在 `data/settings.json` 的 `taskNotifications` 字段）。
 - 窗口在前台时不会弹出通知，避免干扰正在查看的内容。
+
+## 等待用户响应通知
+
+当 AI 在后台等待用户操作时，也会弹出 Windows 通知，提醒你回来处理：
+
+- 触发场景：AI 请求执行工具需要授权（`approval/requested`），或调用 `ask_user_question` 向你提问（`question/requested`）。
+- 实现方式：DshPort 订阅 Harness 的实时事件流 `/api/events.mux`，收到上述事件且窗口在后台时弹出通知；你作答后（`approval/resolved` / `question/resolved`）通知自动关闭。
+- 开关：托盘菜单中的“等待用户响应通知”复选框（默认开启，状态记录在 `data/settings.json` 的 `interactionNotifications` 字段）。
+- 窗口在前台时不会弹出通知。
 
 ## 数据管理
 
