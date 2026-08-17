@@ -8,6 +8,7 @@ const { tmpdir } = require('node:os')
 const { basename, dirname, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
 const { createTaskTracker } = require('./task-tracker.cjs')
+const { frameNotification, frameResolution } = require('./interaction-frames.cjs')
 
 const APP_NAME = 'DshPort'
 const DEFAULT_PORT = 3080
@@ -51,6 +52,11 @@ let installPromptOpen = false
 let lastProgressLabel = ''
 let taskNotifier = null
 const TASK_POLL_INTERVAL_MS = 2000
+let interactionSocket = null
+let interactionReconnectTimer = null
+const MUX_RECONNECT_DELAY_MS = 3000
+// 活跃的"等待用户响应"通知：key（approval:<id> / question:<rpcId>）→ Notification。
+const interactionNotifications = new Map()
 
 function ensureDirectories() {
   for (const path of [dataRoot, dshHome, workspace, logsRoot, updatesDir]) mkdirSync(path, { recursive: true })
@@ -286,12 +292,116 @@ function startTaskNotifier(url) {
   }, TASK_POLL_INTERVAL_MS)
   timer.unref?.()
   taskNotifier = { tracker, timer, url }
+  startInteractionNotifier(url)
 }
 
 function stopTaskNotifier() {
   if (!taskNotifier) return
   clearInterval(taskNotifier.timer)
   taskNotifier = null
+  stopInteractionNotifier()
+}
+
+// 等待用户响应通知：订阅 Harness 的 mux 事件流，AI 请求工具权限或调用
+// ask_user_question 时（窗口在后台）弹通知，用户作答后自动关闭通知。
+function wsUrlOf(httpUrl, path) {
+  return `${httpUrl.replace(/^http:/u, 'ws:')}${path}`
+}
+
+function notifyInteraction({ key, title, body }) {
+  const settings = readSettings()
+  if (settings.interactionNotifications === false) return
+  if (!tray) return
+  // 用户正盯着界面时不打扰。
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()) return
+  const close = () => {
+    interactionNotifications.delete(key)
+  }
+  if (Notification.isSupported()) {
+    try {
+      const notification = new Notification({ title: APP_NAME, body, icon: iconPath })
+      notification.on('click', () => showMainWindow())
+      notification.on('close', close)
+      notification.show()
+      interactionNotifications.set(key, notification)
+      return
+    } catch (error) {
+      console.warn('Windows notification failed, falling back to tray balloon:', error.message)
+    }
+  }
+  try {
+    tray.displayBalloon({ iconType: 'info', title: APP_NAME, content: body })
+  } catch {}
+}
+
+function connectInteractionSocket(url) {
+  if (interactionSocket) return
+  let socket
+  try {
+    socket = new WebSocket(wsUrlOf(url, '/api/events.mux'))
+  } catch (error) {
+    console.warn('Interaction WebSocket connect failed:', error.message)
+    scheduleInteractionReconnect(url)
+    return
+  }
+  socket.onmessage = event => {
+    let envelope
+    try {
+      envelope = JSON.parse(String(event.data))
+    } catch {
+      return
+    }
+    const notification = frameNotification(envelope)
+    if (notification) {
+      notifyInteraction(notification)
+      return
+    }
+    const resolution = frameResolution(envelope)
+    if (resolution) {
+      const active = interactionNotifications.get(resolution.key)
+      if (active) {
+        interactionNotifications.delete(resolution.key)
+        try { active.close() } catch {}
+      }
+    }
+  }
+  socket.onclose = () => {
+    if (interactionSocket === socket) interactionSocket = null
+    if (!shuttingDown) scheduleInteractionReconnect(url)
+  }
+  socket.onerror = () => {
+    try { socket.close() } catch {}
+  }
+  interactionSocket = socket
+}
+
+function scheduleInteractionReconnect(url) {
+  if (interactionReconnectTimer || shuttingDown) return
+  interactionReconnectTimer = setTimeout(() => {
+    interactionReconnectTimer = null
+    connectInteractionSocket(url)
+  }, MUX_RECONNECT_DELAY_MS)
+  interactionReconnectTimer.unref?.()
+}
+
+function startInteractionNotifier(url) {
+  stopInteractionNotifier()
+  connectInteractionSocket(url)
+}
+
+function stopInteractionNotifier() {
+  if (interactionReconnectTimer) {
+    clearTimeout(interactionReconnectTimer)
+    interactionReconnectTimer = null
+  }
+  if (interactionSocket) {
+    try { interactionSocket.close() } catch {}
+    interactionSocket = null
+  }
+  for (const notification of interactionNotifications.values()) {
+    try { notification.close() } catch {}
+  }
+  interactionNotifications.clear()
 }
 
 function createWindow() {
@@ -927,6 +1037,12 @@ function createTray() {
       type: 'checkbox',
       checked: readSettings().taskNotifications !== false,
       click: item => writeSettings({ ...readSettings(), taskNotifications: item.checked }),
+    },
+    {
+      label: '等待用户响应通知',
+      type: 'checkbox',
+      checked: readSettings().interactionNotifications !== false,
+      click: item => writeSettings({ ...readSettings(), interactionNotifications: item.checked }),
     },
     { type: 'separator' },
     { label: '重启 Harness', click: () => restartHarness() },
