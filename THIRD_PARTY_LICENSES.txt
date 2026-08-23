@@ -23,18 +23,19 @@ Electron、@deepseek-ai/dsh 的依赖等其余 npm 依赖延续其各自包的�
          npm: dshmarket
    - 许可证：MIT
 
-3. dsh-pocket（手机访问 / 扫码同屏）
-   - 用途：Harness 内置的“手机访问”（设置 → 手机访问）。
-   - 来源：https://github.com/shaobeichen/dsh-pocket
-         npm: dsh-pocket
-   - 许可证：GPL-2.0
-   - 注：其移动端适配部分移植自 dsh-web-mobile（MIT 许可），
-         相关版权声明保留在 dsh-pocket 包内 client/mobile/LICENSE.dsh-web-mobile。
+--------------------------------------------------------------------------------
+
+关于 dsh-pocket（未随包分发）
+
+   dsh-pocket（手机访问 / 扫码同屏，https://github.com/shaobeichen/dsh-pocket，
+   npm: dsh-pocket）**不随本安装包默认分发**，而是收录在插件市场中，由用户按需安装。
+   其许可证为 GPL-2.0；若你通过插件市场安装它，请遵守 GPL-2.0 的分发与开源条款，
+   并保留其包内的版权声明（其移动端适配部分移植自 dsh-web-mobile，MIT 许可）。
 
 --------------------------------------------------------------------------------
 
 分发提示：
-- 上述插件随安装包分发时未作修改；如需修改 dsh-pocket 等 GPL-2.0 组件的源码，
-  相应修改版须按 GPL-2.0 的条款发布并保留版权声明。
+- 上述随包分发的组件未作修改；如需修改某组件的源码，相应修改版须按该组件的
+  许可证条款发布并保留版权声明。
 - 各组件随构建版本可能更新，具体版本以包内 package.json / node_modules 为准；
   本文件描述的是 DshPort 直接打包的组件与其授权关系。

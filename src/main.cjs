@@ -47,7 +47,7 @@ const iconPath = join(__dirname, '..', 'resources', 'icon.ico')
 const trayIconPath = join(__dirname, '..', 'resources', 'icon.png')
 const updatesDir = join(dataRoot, 'updates')
 const settingsFile = join(dataRoot, 'settings.json')
-// 构建期预置的 web profile（dsh-market 插件市场 + dsh-pocket 手机访问）；首次启动播种到 dsh-home。
+// 构建期预置的 web profile（默认 dsh-market 插件市场）；首次启动播种到 dsh-home。
 const pluginPresetDir = join(__dirname, '..', 'resources', 'presets', 'web-profile')
 
 let mainWindow
@@ -107,7 +107,7 @@ function cleanupStaleUpdateArtifacts() {
   } catch {}
 }
 
-// 把构建期预置的 web profile（dsh-market 插件市场 + dsh-pocket 手机访问）播种到 dsh-home：
+// 把构建期预置的 web profile（dsh-market 插件市场）播种到 dsh-home：
 // - 全新安装：profile 目录不存在 → 整体复制预置 preset（离线、开箱即用）。
 // - 升级场景：profile 已存在但缺内置插件 → 把 preset 里的插件包合并进现有
 //   node_modules，并把 preset 的依赖与 bundles 合入 manifest（只增不删）。
@@ -1561,7 +1561,7 @@ async function restoreData() {
 
 async function start() {
   ensureDirectories()
-  // 把预置的 web 插件 profile（dsh-market + dsh-pocket）播种到 dsh-home（全新复制 / 升级离线合并）。
+  // 把预置的 web 插件 profile（dsh-market）播种到 dsh-home（全新复制 / 升级离线合并）。
   seedPluginPreset()
   installAppMenu()
   // Show the window (loading screen) immediately; never block startup on network calls.

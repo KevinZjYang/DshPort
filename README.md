@@ -81,20 +81,18 @@ DshPort 启动时会检查 `KevinZjYang/DshPort` 的最新 Release；窗口顶�
 - 开关：托盘菜单中的“等待用户响应通知”复选框（默认开启，状态记录在 `data/settings.json` 的 `interactionNotifications` 字段）。
 - 窗口在前台时不会弹出通知。
 
-## 内置插件（插件市场 + 手机访问）
+## 内置插件
 
-DshPort 在生成安装包时把两个 DeepSeek Harness 插件预置进内置的 `web` profile，用户拿到便携包后开箱即用：
+DshPort 在生成安装包时把插件市场（dsh-market）预置进内置的 `web` profile，用户拿到便携包后开箱即用：
 
 - **插件市场**（[dsh-market](https://github.com/dsh-market/dsh-market)）：打开 Harness 的 **设置 → 插件市场** 即可浏览社区目录（1500+ 插件）、搜索、按分类/星标筛选、一键安装与更新。
-- **手机访问**（[dsh-pocket](https://github.com/shaobeichen/dsh-pocket)）：打开 **设置 → 手机访问** 可扫二维码，在手机上实时查看/操控电脑上的 DSH 界面（局域网扫码，或经 cloudflared 公网隧道）。
-
-> ⚠️ **dsh-pocket 桌面端注记**：手机扫码同屏开箱即用。dsh-pocket 设置页里的「更新 / 重启 dsh web」按钮只有在宿主提供了桌面端信号（`desktopProfiles`/`desktopPnpm` 服务，由 DSH Desktop 类应用注册）时才会隐藏——DshPort 不注册该信号，因此请改用 DshPort 自带的 **重启 Harness** 与 **检查更新**，不要点 dsh-pocket 页面里的「重启」（那会脱离 DshPort 的进程管理）。若需彻底隐藏，后续可在 profile 中注入一个提供上述服务的标记 bundle（未内置）。
+- **其余插件（如 dsh-pocket 手机访问）**：不在默认预置里，但都已收录在插件市场内，可在 **设置 → 插件市场** 一键安装（例如 dsh-pocket 手机访问：扫二维码在手机上实时查看/操控电脑上的 DSH）。
 - **全新安装**：首次启动会把预置插件 profile 复制进 `data/dsh-home/profiles/web/`，无需联网、无需手动安装 pnpm。
 - **已有数据（升级场景）**：若 `web` profile 已存在但缺少内置插件，会在启动时把预置插件离线合并进现有 profile（只增不删，不破坏用户已装的其它插件）。
 - 构建期可用环境变量控制：
-  - `DSH_PLUGINS=...`：预置的插件清单（空格分隔的包名/规格），默认 `dshmarket dsh-pocket`；设为 `0` 或空则跳过预置。
+  - `DSH_PLUGINS=...`：预置的插件清单（空格分隔的包名/规格），默认 `dshmarket`；设为 `0` 或空则跳过预置。
 
-> ⚠️ **许可提示**：DshPort 本身为 MIT；所预置的 dsh-market 为 MIT、dsh-pocket 为 **GPL-2.0**。把 GPL-2.0 组件随安装包一起分发时，请评估是否满足 GPL 的分发与开源条款（尤其如果面向他人分发）。本安装包内置一份 **`THIRD_PARTY_LICENSES.txt`**（随包分发，也在“关于”对话框可查看），列出了内置组件及其许可证与来源，可作为第三方许可声明。
+> ⚠️ **许可提示**：DshPort 本身为 MIT；默认预置的 dsh-market 为 MIT。`dsh-pocket` 为 **GPL-2.0**，但**默认不随包分发**，仅在用户通过插件市场自行安装时涉及 GPL 合规。本安装包内置一份 **`THIRD_PARTY_LICENSES.txt`**（随包分发，也在“关于”对话框可查看），列出了内置组件及其许可证与来源，可作为第三方许可声明。
 
 ## 数据管理
 

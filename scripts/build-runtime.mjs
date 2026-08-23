@@ -22,7 +22,7 @@ const nodeVersion = process.env.DSH_NODE_VERSION || 'v24.14.0'
 const nodeZip = `node-${nodeVersion}-win-x64.zip`
 const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/${nodeZip}`
 // Bundled-plugin preset: a pre-seeded `web` profile with dsh-market (plugin
-// market) + dsh-pocket (手机访问/扫码) bundled into the portable package.
+// market) bundled into the portable package; other plugins install on demand.
 const presetRoot = join(projectRoot, 'resources', 'presets', 'web-profile')
 const presetSeedHome = join(cacheRoot, 'preset-seed')
 
@@ -240,7 +240,7 @@ async function prepareUpdater() {
   await cp(join(projectRoot, 'src', 'update-progress.ps1'), join(updaterRoot, 'update-progress.ps1'))
 }
 
-// —— 内置插件（dsh-market 插件市场 + dsh-pocket 手机访问）预置 profile ——
+// —— 内置插件（dsh-market 插件市场）预置 profile ——
 
 async function readHarnessVersion() {
   try {
@@ -256,11 +256,12 @@ async function readHarnessVersion() {
 // finds it directly — no npm-based pnpm bootstrap (which can crash on npm's
 // peer-resolution edge cases).
 
-// 预置进 web profile 的插件清单。默认：dsh-market（插件市场）+ dsh-pocket（手机访问）。
-// 用 DSH_PLUGINS 覆盖（空格分隔的包名/规格）；设为 0 或空则跳过预置。
+// 预置进 web profile 的插件清单。默认只预置 dsh-market（插件市场）——dsh-pocket 等
+// 其余插件已收录在插件市场里，由用户按需安装，无需随包预置。用 DSH_PLUGINS 覆盖
+// （空格分隔的包名/规格）；设为 0 或空则跳过预置。
 function resolvePresetPlugins() {
   const raw = process.env.DSH_PLUGINS
-  if (raw === undefined || raw === '0') return ['dshmarket', 'dsh-pocket']
+  if (raw === undefined || raw === '0') return ['dshmarket']
   return raw.split(/\s+/u).filter(Boolean)
 }
 
@@ -270,12 +271,14 @@ function packageNameOf(spec) {
   return at === -1 ? spec : spec.slice(0, at)
 }
 
-// 预置 profile 是否已包含请求的全部插件（避免插件清单变化后旧预置被误复用）。
+// 预置 profile 的依赖是否与请求的插件清单**完全一致**（增/删插件都会触发重新生成，
+// 避免旧预置里残留已移除的插件）。
 async function presetMatchesPlugins(plugins) {
   try {
     const manifest = JSON.parse(await readFile(join(presetRoot, 'package.json'), 'utf8'))
-    const dependencies = manifest.dependencies || {}
-    return plugins.every(spec => Object.prototype.hasOwnProperty.call(dependencies, packageNameOf(spec)))
+    const dependencies = Object.keys(manifest.dependencies || {})
+    const requested = plugins.map(packageNameOf)
+    return dependencies.length === requested.length && requested.every(name => dependencies.includes(name))
   } catch {
     return false
   }
