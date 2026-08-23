@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs'
 import { access, cp, lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -25,7 +25,6 @@ const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/${nodeZip}`
 // market) + dsh-pocket (手机访问/扫码) bundled into the portable package.
 const presetRoot = join(projectRoot, 'resources', 'presets', 'web-profile')
 const presetSeedHome = join(cacheRoot, 'preset-seed')
-const pnpmToolRoot = join(projectRoot, 'dist-exe', '.pnpm-tool')
 
 async function run(command, args, cwd = projectRoot, env = process.env) {
   await new Promise((resolveRun, reject) => {
@@ -251,20 +250,11 @@ async function readHarnessVersion() {
   }
 }
 
-// `dsh plugin` is a thin pnpm forwarder, but DshPort's bundled Node only ships
-// npm (no pnpm). Bootstrap a temporary pnpm with the system npm so the build
-// can run `dsh plugin --profile web add <plugins>`; the tooling is never shipped.
-async function bootstrapPnpm() {
-  await rm(pnpmToolRoot, { recursive: true, force: true })
-  await mkdir(pnpmToolRoot, { recursive: true })
-  await run('npm', ['install', 'pnpm', '--no-audit', '--no-fund'], pnpmToolRoot)
-  const binDir = join(pnpmToolRoot, 'node_modules', '.bin')
-  const pnpmName = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
-  if (!(await exists(join(binDir, pnpmName)))) {
-    throw new Error(`pnpm could not be bootstrapped at ${binDir}`)
-  }
-  return binDir
-}
+// `dsh plugin` is a thin pnpm forwarder and needs `pnpm` on PATH. The build
+// environment (GitHub Actions: setup-node + pnpm/action-setup; local per the
+// README's `pnpm install --frozen-lockfile`) already has pnpm, so `dsh plugin`
+// finds it directly — no npm-based pnpm bootstrap (which can crash on npm's
+// peer-resolution edge cases).
 
 // 预置进 web profile 的插件清单。默认：dsh-market（插件市场）+ dsh-pocket（手机访问）。
 // 用 DSH_PLUGINS 覆盖（空格分隔的包名/规格）；设为 0 或空则跳过预置。
@@ -298,15 +288,10 @@ async function preparePluginPreset() {
   if ((await exists(join(presetRoot, 'package.json'))) && (await presetMatchesPlugins(plugins))) return
   const harnessVersion = await readHarnessVersion()
   console.log(`Seeding plugin preset (harness ${harnessVersion}, plugins ${plugins.join(' ')})…`)
-  const pnpmBin = await bootstrapPnpm()
   await rm(presetSeedHome, { recursive: true, force: true })
   await mkdir(join(presetSeedHome, 'profiles'), { recursive: true })
   const nodeExe = join(nodeRoot, process.platform === 'win32' ? 'node.exe' : 'node')
-  const env = {
-    ...process.env,
-    DSH_HOME: presetSeedHome,
-    PATH: `${pnpmBin}${delimiter}${process.env.PATH || ''}`,
-  }
+  const env = { ...process.env, DSH_HOME: presetSeedHome }
   await run(
     nodeExe,
     [join(harnessRoot, 'lib', 'bin.js'), 'plugin', '--profile', 'web', 'add', ...plugins, '-w'],
