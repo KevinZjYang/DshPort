@@ -5,7 +5,7 @@ const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdt
 const http = require('node:http')
 const https = require('node:https')
 const { tmpdir } = require('node:os')
-const { basename, dirname, join } = require('node:path')
+const { basename, dirname, isAbsolute, join } = require('node:path')
 const { compareVersions, parseDshReleaseCommit, portableDataPaths } = require('./portable-paths.cjs')
 const {
   MANIFEST_NAME,
@@ -107,11 +107,112 @@ function cleanupStaleUpdateArtifacts() {
   } catch {}
 }
 
+// 内置 node 运行时目录里的 pnpm 入口（corepack shim）。用它来询问 pnpm
+// “这台机器的默认 store 在哪”，而不是依赖 PATH 上的 pnpm（GUI/桌面启动
+// 不继承终端 PATH）。返回 [nodeExe, pnpmJs]，任一不存在则返回 null。
+function bundledPnpmEntry() {
+  const nodeExe = join(runtimeRoot, 'node', process.platform === 'win32' ? 'node.exe' : 'node')
+  const pnpmJs = join(runtimeRoot, 'node', 'node_modules', 'corepack', 'dist', 'pnpm.js')
+  if (!existsSync(nodeExe) || !existsSync(pnpmJs)) return null
+  return { nodeExe, pnpmJs }
+}
+
+// 用内置 pnpm 查询这台机器为给定 profile 目录解析出的默认 store 路径。
+// 输出要 purge 的路径一样取自 `pnpm store path`，所以二者必然一致。
+// 失败（pnpm 缺失、corepack 首次运行需联网下载、超时、异常）返回 null；
+// 调用方必须据此回退到“删除 pnpm 元数据、让 pnpm 自行重建”。
+function resolveLocalPnpmStore(profileDir) {
+  return new Promise(resolve => {
+    const entry = bundledPnpmEntry()
+    if (entry === null) return resolve(null)
+    const child = spawn(entry.nodeExe, [entry.pnpmJs, 'store', 'path'], {
+      cwd: profileDir,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    const timer = setTimeout(() => { try { child.kill() } catch {}; resolve(null) }, 30000)
+    child.stdout.on('data', chunk => { stdout += chunk })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', () => { clearTimeout(timer); resolve(null) })
+    child.on('close', code => {
+      clearTimeout(timer)
+      if (code !== 0) return resolve(null)
+      const lines = stdout.split(/\r?\n/u).map(line => line.trim()).filter(Boolean)
+      const store = lines[lines.length - 1] || ''
+      resolve(store !== '' && isAbsolute(store) ? store : null)
+    })
+  })
+}
+
+// 删除 pnpm 的“store 身份”文件：这些文件里写死了打包机（CI）的 store/virtual
+// store 绝对路径。删掉后 pnpm 会把该 profile 当作普通已安装目录，在首次写操作
+// 时按本机 store 自行重建（代价是首次操作会按 pnpm-lock.yaml 重新拉取内置依赖）。
+function stripPnpmStoreIdentity(modulesDir) {
+  for (const name of ['.modules.yaml', '.package-map.json', '.pnpm-workspace-state-v1.json']) {
+    try { rmSync(join(modulesDir, name), { force: true }) } catch {}
+  }
+  for (const name of ['.bin', '.pnpm']) {
+    try { rmSync(join(modulesDir, name), { recursive: true, force: true }) } catch {}
+  }
+}
+
+// 修正播种后 profile 的 pnpm store 身份，使它指向本机 store，而不是打包机的。
+// 预置 preset 是构建期在 CI 上用 pnpm 生成的，node_modules/.modules.yaml（及其
+// .pnpm-workspace-state-v1.json）里因此写着 CI 机器的
+//   storeDir: D:\.pnpm-store\v11
+//   virtualStoreDir: D:\a\DshPort\...\.cache\preset-seed\...\node_modules\.pnpm
+// 把这些原样复制到用户机器后，市场执行 `pnpm add <pkg>@latest` 时 pnpm 11 的
+// checkCompatibility 会拿它们和本机 store 对比，不一致就抛
+// ERR_PNPM_UNEXPECTED_STORE，导致市场里的一切安装/更新直接被拒。
+//
+// 首选：用本机 pnpm 拿到 store 路径并改写 .modules.yaml（nodeLinker: hoisted 下
+// 依赖是真实文件副本、并不依赖那条 store，所以改写后 pnpm 直接复用、无重新下载）。
+// 回退：拿不到本机 store（pnpm 缺失/需联网）→ 删掉 pnpm store 身份文件，让 pnpm
+// 首次操作时自行重建。任何失败都只记日志，不阻塞启动。
+async function normalizeProfilePnpmStore(webProfileDir) {
+  const modulesDir = join(webProfileDir, 'node_modules')
+  const modulesFile = join(modulesDir, '.modules.yaml')
+  if (!existsSync(modulesFile)) return
+  try {
+    const storeDir = await resolveLocalPnpmStore(webProfileDir)
+    if (storeDir === null) {
+      stripPnpmStoreIdentity(modulesDir)
+      console.log('Normalized web profile: pnpm store unavailable, stripped store identity (pnpm will relink locally)')
+      return
+    }
+    const virtualStoreDir = join(modulesDir, '.pnpm')
+    const modules = JSON.parse(readFileSync(modulesFile, 'utf8'))
+    modules.storeDir = storeDir
+    modules.virtualStoreDir = virtualStoreDir
+    writeFileSync(modulesFile, `${JSON.stringify(modules, null, 2)}\n`)
+    // 顺带把 workspace 状态里的 CI 工程路径替换为本机 profile 目录。
+    const wsFile = join(modulesDir, '.pnpm-workspace-state-v1.json')
+    if (existsSync(wsFile)) {
+      try {
+        const ws = JSON.parse(readFileSync(wsFile, 'utf8'))
+        if (ws.projects && typeof ws.projects === 'object') {
+          const name = (Object.values(ws.projects)[0] || {}).name
+          ws.projects = { [webProfileDir]: { name } }
+          writeFileSync(wsFile, `${JSON.stringify(ws, null, 2)}\n`)
+        }
+      } catch {}
+    }
+    console.log(`Normalized web profile pnpm store -> ${storeDir}`)
+  } catch (error) {
+    stripPnpmStoreIdentity(modulesDir)
+    console.warn('Failed to normalize web profile pnpm store, stripped store identity:', error.message)
+  }
+}
+
 // 把构建期预置的 web profile（dsh-market 插件市场）播种到 dsh-home：
 // - 全新安装：profile 目录不存在 → 整体复制预置 preset（离线、开箱即用）。
 // - 升级场景：profile 已存在但缺内置插件 → 把 preset 里的插件包合并进现有
 //   node_modules，并把 preset 的依赖与 bundles 合入 manifest（只增不删）。
 // 任何失败都只记日志、不阻塞 Harness 启动（插件缺失时 Harness 仍会正常初始化 profile）。
+// 播种完成后（无论全新还是合并、甚至已就绪），都会试着修正 pnpm store 身份，
+// 否则市场里的安装/更新会因打包机的 store 路径被 pnpm 拒绝。
 function seedPluginPreset() {
   const presetManifest = join(pluginPresetDir, 'package.json')
   if (!existsSync(presetManifest)) return
@@ -123,53 +224,55 @@ function seedPluginPreset() {
       mkdirSync(dirname(webProfileDir), { recursive: true })
       cpSync(pluginPresetDir, webProfileDir, { recursive: true })
       console.log('Seeded default web profile with bundled plugin preset')
-      return
     } catch (error) {
       console.warn('Failed to seed bundled plugin preset:', error.message)
       return
     }
-  }
-  // 升级/已有 profile：离线补齐内置插件，保留用户原有插件。
-  try {
-    const preset = JSON.parse(readFileSync(presetManifest, 'utf8'))
-    const presetDependencies = preset.dependencies || {}
-    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    const dependencies = manifest.dependencies || {}
-    if (Object.keys(presetDependencies).every(name => {
-      return Object.prototype.hasOwnProperty.call(dependencies, name)
-    })) {
-      // 所有内置插件已在 manifest 中，无需合并。
-      return
-    }
-    const presetModules = join(pluginPresetDir, 'node_modules')
-    if (existsSync(presetModules)) {
-      mkdirSync(join(webProfileDir, 'node_modules'), { recursive: true })
-      for (const name of readdirSync(presetModules)) {
-        if (name === '.bin' || name === '.pnpm' || name === '.package-lock.json') continue
-        const source = join(presetModules, name)
-        const target = join(webProfileDir, 'node_modules', name)
-        if (!existsSync(target)) cpSync(source, target, { recursive: true })
+  } else {
+    // 升级/已有 profile：离线补齐内置插件，保留用户原有插件。
+    try {
+      const preset = JSON.parse(readFileSync(presetManifest, 'utf8'))
+      const presetDependencies = preset.dependencies || {}
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+      const dependencies = manifest.dependencies || {}
+      if (!Object.keys(presetDependencies).every(name => {
+        return Object.prototype.hasOwnProperty.call(dependencies, name)
+      })) {
+        const presetModules = join(pluginPresetDir, 'node_modules')
+        if (existsSync(presetModules)) {
+          mkdirSync(join(webProfileDir, 'node_modules'), { recursive: true })
+          for (const name of readdirSync(presetModules)) {
+            if (name === '.bin' || name === '.pnpm' || name === '.package-lock.json') continue
+            const source = join(presetModules, name)
+            const target = join(webProfileDir, 'node_modules', name)
+            if (!existsSync(target)) cpSync(source, target, { recursive: true })
+          }
+        }
+        const mergedDependencies = { ...dependencies }
+        for (const [name, spec] of Object.entries(presetDependencies)) {
+          if (!Object.prototype.hasOwnProperty.call(mergedDependencies, name)) mergedDependencies[name] = spec
+        }
+        const presetBundles = preset.dsh?.profile?.bundles || []
+        const mergedBundles = [...(manifest.dsh?.profile?.bundles || [])]
+        for (const id of presetBundles) {
+          if (!mergedBundles.includes(id)) mergedBundles.push(id)
+        }
+        const next = {
+          ...manifest,
+          dependencies: mergedDependencies,
+          dsh: { ...manifest.dsh, profile: { ...(manifest.dsh?.profile || {}), bundles: mergedBundles } },
+        }
+        writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`)
+        console.log('Merged bundled plugins into existing web profile')
       }
+    } catch (error) {
+      console.warn('Failed to merge bundled plugin preset:', error.message)
     }
-    const mergedDependencies = { ...dependencies }
-    for (const [name, spec] of Object.entries(presetDependencies)) {
-      if (!Object.prototype.hasOwnProperty.call(mergedDependencies, name)) mergedDependencies[name] = spec
-    }
-    const presetBundles = preset.dsh?.profile?.bundles || []
-    const mergedBundles = [...(manifest.dsh?.profile?.bundles || [])]
-    for (const id of presetBundles) {
-      if (!mergedBundles.includes(id)) mergedBundles.push(id)
-    }
-    const next = {
-      ...manifest,
-      dependencies: mergedDependencies,
-      dsh: { ...manifest.dsh, profile: { ...(manifest.dsh?.profile || {}), bundles: mergedBundles } },
-    }
-    writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`)
-    console.log('Merged bundled plugins into existing web profile')
-  } catch (error) {
-    console.warn('Failed to merge bundled plugin preset:', error.message)
   }
+  // 播种后修正 pnpm store 身份（异步、不阻塞启动；失败只记日志）。
+  normalizeProfilePnpmStore(webProfileDir).catch(error => {
+    console.warn('Failed to normalize seeded profile pnpm store:', error.message)
+  })
 }
 
 function getVersion() {
@@ -232,13 +335,26 @@ function spawnHarness(port) {
   const binPath = join(runtimeRoot, 'harness', 'lib', 'bin.js')
   const logPath = join(logsRoot, 'harness.log')
   const logStream = require('node:fs').createWriteStream(logPath, { flags: 'a' })
+  // 让 Harness 子进程能 `dsh plugin` 里的 pnpm：market 安装/更新是
+  // `dsh plugin --profile <p> <pnpm args>` → bin.js 用 `spawnSync('pnpm', …)`
+  // 转发。pnpm 只有内置 node 目录里的 corepack shim（pnpm.CMD/pnpm.ps1），
+  // 不在系统 PATH 上；若不把该目录加进 PATH，Windows 就报 “'pnpm' 不是内部或
+  // 外部命令”/spawn ENOENT，市场一切安装/更新都失败（手机视图即明文错误）。
+  const nodeBinDir = join(runtimeRoot, 'node')
+  const sep = process.platform === 'win32' ? ';' : ':'
+  const pathParts = (process.env.PATH || '').split(sep).filter(part => part !== '')
+  if (!pathParts.includes(nodeBinDir)) pathParts.unshift(nodeBinDir)
   const env = {
     ...process.env,
     DSH_HOME: dshHome,
     DSH_WEB_WORKSPACE: workspace,
+    PATH: pathParts.join(sep),
   }
   delete env.ELECTRON_RUN_AS_NODE
-  const child = spawn(nodePath, [binPath, 'web', '--host', '127.0.0.1', '--port', String(port)], {
+  // `dsh web` 默认会在系统默认浏览器里打开 UI；DshPort 自己已经把 UI 嵌入
+  // Electron 窗口（sendUrlToWindow），再弹一个浏览器标签页是多余的。传
+  // --no-open 关掉它。
+  const child = spawn(nodePath, [binPath, 'web', '--no-open', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: workspace,
     env,
     windowsHide: true,
