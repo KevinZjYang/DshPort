@@ -1,7 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHash, randomUUID } = require('node:crypto')
-const { createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
+const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const http = require('node:http')
 const https = require('node:https')
 const { tmpdir } = require('node:os')
@@ -47,6 +47,8 @@ const iconPath = join(__dirname, '..', 'resources', 'icon.ico')
 const trayIconPath = join(__dirname, '..', 'resources', 'icon.png')
 const updatesDir = join(dataRoot, 'updates')
 const settingsFile = join(dataRoot, 'settings.json')
+// 构建期预置的 web profile（dsh-market 插件市场 + dsh-pocket 手机访问）；首次启动播种到 dsh-home。
+const pluginPresetDir = join(__dirname, '..', 'resources', 'presets', 'web-profile')
 
 let mainWindow
 let harnessProcess
@@ -103,6 +105,71 @@ function cleanupStaleUpdateArtifacts() {
       }
     }
   } catch {}
+}
+
+// 把构建期预置的 web profile（dsh-market 插件市场 + dsh-pocket 手机访问）播种到 dsh-home：
+// - 全新安装：profile 目录不存在 → 整体复制预置 preset（离线、开箱即用）。
+// - 升级场景：profile 已存在但缺内置插件 → 把 preset 里的插件包合并进现有
+//   node_modules，并把 preset 的依赖与 bundles 合入 manifest（只增不删）。
+// 任何失败都只记日志、不阻塞 Harness 启动（插件缺失时 Harness 仍会正常初始化 profile）。
+function seedPluginPreset() {
+  const presetManifest = join(pluginPresetDir, 'package.json')
+  if (!existsSync(presetManifest)) return
+  const webProfileDir = join(dshHome, 'profiles', 'web')
+  const manifestPath = join(webProfileDir, 'package.json')
+  // 全新安装：直接播种预先构建好的 profile，无需联网。
+  if (!existsSync(manifestPath)) {
+    try {
+      mkdirSync(dirname(webProfileDir), { recursive: true })
+      cpSync(pluginPresetDir, webProfileDir, { recursive: true })
+      console.log('Seeded default web profile with bundled plugin preset')
+      return
+    } catch (error) {
+      console.warn('Failed to seed bundled plugin preset:', error.message)
+      return
+    }
+  }
+  // 升级/已有 profile：离线补齐内置插件，保留用户原有插件。
+  try {
+    const preset = JSON.parse(readFileSync(presetManifest, 'utf8'))
+    const presetDependencies = preset.dependencies || {}
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    const dependencies = manifest.dependencies || {}
+    if (Object.keys(presetDependencies).every(name => {
+      return Object.prototype.hasOwnProperty.call(dependencies, name)
+    })) {
+      // 所有内置插件已在 manifest 中，无需合并。
+      return
+    }
+    const presetModules = join(pluginPresetDir, 'node_modules')
+    if (existsSync(presetModules)) {
+      mkdirSync(join(webProfileDir, 'node_modules'), { recursive: true })
+      for (const name of readdirSync(presetModules)) {
+        if (name === '.bin' || name === '.pnpm' || name === '.package-lock.json') continue
+        const source = join(presetModules, name)
+        const target = join(webProfileDir, 'node_modules', name)
+        if (!existsSync(target)) cpSync(source, target, { recursive: true })
+      }
+    }
+    const mergedDependencies = { ...dependencies }
+    for (const [name, spec] of Object.entries(presetDependencies)) {
+      if (!Object.prototype.hasOwnProperty.call(mergedDependencies, name)) mergedDependencies[name] = spec
+    }
+    const presetBundles = preset.dsh?.profile?.bundles || []
+    const mergedBundles = [...(manifest.dsh?.profile?.bundles || [])]
+    for (const id of presetBundles) {
+      if (!mergedBundles.includes(id)) mergedBundles.push(id)
+    }
+    const next = {
+      ...manifest,
+      dependencies: mergedDependencies,
+      dsh: { ...manifest.dsh, profile: { ...(manifest.dsh?.profile || {}), bundles: mergedBundles } },
+    }
+    writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`)
+    console.log('Merged bundled plugins into existing web profile')
+  } catch (error) {
+    console.warn('Failed to merge bundled plugin preset:', error.message)
+  }
 }
 
 function getVersion() {
@@ -1489,6 +1556,8 @@ async function restoreData() {
 
 async function start() {
   ensureDirectories()
+  // 把预置的 web 插件 profile（dsh-market + dsh-pocket）播种到 dsh-home（全新复制 / 升级离线合并）。
+  seedPluginPreset()
   installAppMenu()
   // Show the window (loading screen) immediately; never block startup on network calls.
   createWindow()

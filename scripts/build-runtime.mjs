@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs'
 import { access, cp, lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -21,13 +21,18 @@ const sourceRef = process.env.DSH_SOURCE_REF || 'master'
 const nodeVersion = process.env.DSH_NODE_VERSION || 'v24.14.0'
 const nodeZip = `node-${nodeVersion}-win-x64.zip`
 const nodeUrl = `https://nodejs.org/dist/${nodeVersion}/${nodeZip}`
+// Bundled-plugin preset: a pre-seeded `web` profile with dsh-market (plugin
+// market) + dsh-pocket (手机访问/扫码) bundled into the portable package.
+const presetRoot = join(projectRoot, 'resources', 'presets', 'web-profile')
+const presetSeedHome = join(cacheRoot, 'preset-seed')
+const pnpmToolRoot = join(projectRoot, 'dist-exe', '.pnpm-tool')
 
-async function run(command, args, cwd = projectRoot) {
+async function run(command, args, cwd = projectRoot, env = process.env) {
   await new Promise((resolveRun, reject) => {
     const usesCmdShim = process.platform === 'win32' && ['npm', 'npx', 'pnpm'].includes(command)
     const executable = usesCmdShim ? process.env.ComSpec || 'cmd.exe' : command
     const executableArgs = usesCmdShim ? ['/d', '/c', command, ...args] : args
-    const child = spawn(executable, executableArgs, { cwd, stdio: 'inherit', windowsHide: true })
+    const child = spawn(executable, executableArgs, { cwd, stdio: 'inherit', windowsHide: true, env })
     child.once('exit', code => code === 0 ? resolveRun() : reject(new Error(`${command} exited with ${code}`)))
     child.once('error', reject)
   })
@@ -236,9 +241,92 @@ async function prepareUpdater() {
   await cp(join(projectRoot, 'src', 'update-progress.ps1'), join(updaterRoot, 'update-progress.ps1'))
 }
 
+// —— 内置插件（dsh-market 插件市场 + dsh-pocket 手机访问）预置 profile ——
+
+async function readHarnessVersion() {
+  try {
+    return JSON.parse(await readFile(join(harnessRoot, 'package.json'), 'utf8')).version || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+// `dsh plugin` is a thin pnpm forwarder, but DshPort's bundled Node only ships
+// npm (no pnpm). Bootstrap a temporary pnpm with the system npm so the build
+// can run `dsh plugin --profile web add <plugins>`; the tooling is never shipped.
+async function bootstrapPnpm() {
+  await rm(pnpmToolRoot, { recursive: true, force: true })
+  await mkdir(pnpmToolRoot, { recursive: true })
+  await run('npm', ['install', 'pnpm', '--no-audit', '--no-fund'], pnpmToolRoot)
+  const binDir = join(pnpmToolRoot, 'node_modules', '.bin')
+  const pnpmName = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+  if (!(await exists(join(binDir, pnpmName)))) {
+    throw new Error(`pnpm could not be bootstrapped at ${binDir}`)
+  }
+  return binDir
+}
+
+// 预置进 web profile 的插件清单。默认：dsh-market（插件市场）+ dsh-pocket（手机访问）。
+// 用 DSH_PLUGINS 覆盖（空格分隔的包名/规格）；设为 0 或空则跳过预置。
+function resolvePresetPlugins() {
+  const raw = process.env.DSH_PLUGINS
+  if (raw === undefined || raw === '0') return ['dshmarket', 'dsh-pocket']
+  return raw.split(/\s+/u).filter(Boolean)
+}
+
+// 从 `name@version` / `@scope/pkg@version` 中提取纯包名。
+function packageNameOf(spec) {
+  const at = spec.startsWith('@') ? spec.indexOf('@', 1) : spec.indexOf('@')
+  return at === -1 ? spec : spec.slice(0, at)
+}
+
+// 预置 profile 是否已包含请求的全部插件（避免插件清单变化后旧预置被误复用）。
+async function presetMatchesPlugins(plugins) {
+  try {
+    const manifest = JSON.parse(await readFile(join(presetRoot, 'package.json'), 'utf8'))
+    const dependencies = manifest.dependencies || {}
+    return plugins.every(spec => Object.prototype.hasOwnProperty.call(dependencies, packageNameOf(spec)))
+  } catch {
+    return false
+  }
+}
+
+async function preparePluginPreset() {
+  const plugins = resolvePresetPlugins()
+  if (plugins.length === 0) return
+  // Idempotent unless the requested plugin set changed.
+  if ((await exists(join(presetRoot, 'package.json'))) && (await presetMatchesPlugins(plugins))) return
+  const harnessVersion = await readHarnessVersion()
+  console.log(`Seeding plugin preset (harness ${harnessVersion}, plugins ${plugins.join(' ')})…`)
+  const pnpmBin = await bootstrapPnpm()
+  await rm(presetSeedHome, { recursive: true, force: true })
+  await mkdir(join(presetSeedHome, 'profiles'), { recursive: true })
+  const nodeExe = join(nodeRoot, process.platform === 'win32' ? 'node.exe' : 'node')
+  const env = {
+    ...process.env,
+    DSH_HOME: presetSeedHome,
+    PATH: `${pnpmBin}${delimiter}${process.env.PATH || ''}`,
+  }
+  await run(
+    nodeExe,
+    [join(harnessRoot, 'lib', 'bin.js'), 'plugin', '--profile', 'web', 'add', ...plugins, '-w'],
+    projectRoot,
+    env,
+  )
+  const seededProfile = join(presetSeedHome, 'profiles', 'web')
+  if (!(await exists(join(seededProfile, 'package.json')))) {
+    throw new Error('plugin preset seed did not produce a web profile')
+  }
+  await rm(presetRoot, { recursive: true, force: true })
+  await mkdir(dirname(presetRoot), { recursive: true })
+  await cp(seededProfile, presetRoot, { recursive: true })
+  console.log(`Plugin preset written to ${presetRoot}`)
+}
+
 await prepareSource()
 await generateIcon()
 await prepareNode()
 await prepareHarness()
+await preparePluginPreset()
 await prepareUpdater()
 console.log(`Desktop runtime prepared at ${runtimeRoot}`)
