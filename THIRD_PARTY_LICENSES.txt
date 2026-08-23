@@ -1,0 +1,40 @@
+DshPort —— 第三方组件许可声明
+==============================
+
+DshPort 本体：MIT License（见仓库根目录 LICENSE）。
+
+以下列出的是由 DshPort 直接打包/预置的第三方组件及其许可证。
+各组件及其代码、版权归其各自作者所有；它们在发行物中以各自 npm 包源码及
+许可证形式随包分发，DshPort 未对其源码作修改。除本文件列出的组件外，
+Electron、@deepseek-ai/dsh 的依赖等其余 npm 依赖延续其各自包的许可证，
+并保留各包内的 LICENSE 与版权声明（Electron 另附带 LICENSES.chromium.html）。
+
+--------------------------------------------------------------------------------
+
+1. DeepSeek Harness（@deepseek-ai/dsh）
+   - 用途：DshPort 启动的 Harness 运行时（内置 web 应用）。
+   - 来源：https://github.com/deepseek-ai/deepseek-harness
+         npm: @deepseek-ai/dsh
+   - 许可证：以 @deepseek-ai/dsh 及上游仓库声明的许可证为准。
+
+2. dsh-market（插件市场）
+   - 用途：Harness 内置的插件市场（设置 → 插件市场）。
+   - 来源：https://github.com/dsh-market/dsh-market
+         npm: dshmarket
+   - 许可证：MIT
+
+3. dsh-pocket（手机访问 / 扫码同屏）
+   - 用途：Harness 内置的“手机访问”（设置 → 手机访问）。
+   - 来源：https://github.com/shaobeichen/dsh-pocket
+         npm: dsh-pocket
+   - 许可证：GPL-2.0
+   - 注：其移动端适配部分移植自 dsh-web-mobile（MIT 许可），
+         相关版权声明保留在 dsh-pocket 包内 client/mobile/LICENSE.dsh-web-mobile。
+
+--------------------------------------------------------------------------------
+
+分发提示：
+- 上述插件随安装包分发时未作修改；如需修改 dsh-pocket 等 GPL-2.0 组件的源码，
+  相应修改版须按 GPL-2.0 的条款发布并保留版权声明。
+- 各组件随构建版本可能更新，具体版本以包内 package.json / node_modules 为准；
+  本文件描述的是 DshPort 直接打包的组件与其授权关系。

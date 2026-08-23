@@ -100,6 +100,8 @@ async function main() {
   await mkdir(appRoot, { recursive: true })
   await cp(join(projectRoot, 'src'), join(appRoot, 'src'), { recursive: true })
   await cp(join(projectRoot, 'resources'), join(appRoot, 'resources'), { recursive: true })
+  // 第三方组件许可声明随包分发（置于应用包根目录）。
+  await cp(join(projectRoot, 'THIRD_PARTY_LICENSES.txt'), join(appRoot, 'THIRD_PARTY_LICENSES.txt'))
   const manifest = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8'))
   manifest.version = (process.env.DSHPORT_VERSION || manifest.version).replace(/^v/u, '')
   delete manifest.devDependencies

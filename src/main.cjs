@@ -1066,12 +1066,17 @@ async function showAbout() {
       `数据目录：${dataRoot}`,
       `日志目录：${logsRoot}`,
     ].join('\n'),
-    buttons: ['打开数据目录', '打开日志目录', '确定'],
-    defaultId: 2,
-    cancelId: 2,
+    buttons: ['打开数据目录', '打开日志目录', '第三方许可', '确定'],
+    defaultId: 3,
+    cancelId: 3,
   })
   if (answer.response === 0) shell.openPath(dataRoot)
   else if (answer.response === 1) shell.openPath(logsRoot)
+  else if (answer.response === 2) {
+    const licensesPath = join(__dirname, '..', 'THIRD_PARTY_LICENSES.txt')
+    if (existsSync(licensesPath)) shell.openPath(licensesPath)
+    else dialog.showMessageBox({ type: 'info', title: APP_NAME, message: '未找到第三方许可文件。' })
+  }
 }
 
 function installAppMenu() {

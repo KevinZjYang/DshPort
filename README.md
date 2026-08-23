@@ -94,7 +94,7 @@ DshPort 在生成安装包时把两个 DeepSeek Harness 插件预置进内置的
 - 构建期可用环境变量控制：
   - `DSH_PLUGINS=...`：预置的插件清单（空格分隔的包名/规格），默认 `dshmarket dsh-pocket`；设为 `0` 或空则跳过预置。
 
-> ⚠️ **许可提示**：DshPort 本身为 MIT；所预置的 dsh-market 为 MIT、dsh-pocket 为 **GPL-2.0**。把 GPL-2.0 组件随安装包一起分发时，请评估是否满足 GPL 的分发与开源条款（尤其如果面向他人分发）。
+> ⚠️ **许可提示**：DshPort 本身为 MIT；所预置的 dsh-market 为 MIT、dsh-pocket 为 **GPL-2.0**。把 GPL-2.0 组件随安装包一起分发时，请评估是否满足 GPL 的分发与开源条款（尤其如果面向他人分发）。本安装包内置一份 **`THIRD_PARTY_LICENSES.txt`**（随包分发，也在“关于”对话框可查看），列出了内置组件及其许可证与来源，可作为第三方许可声明。
 
 ## 数据管理
 
