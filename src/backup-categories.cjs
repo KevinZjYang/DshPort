@@ -64,6 +64,18 @@ function collectSources(dataRoot, categories) {
   return plan
 }
 
+// dsh-home/profiles 下所有带 package.json 的 profile 目录（绝对路径）。
+// 备份不含 node_modules，恢复 Harness 设置后这些 profile 声明的插件依赖需要与
+// 本地 node_modules 对齐（新设备上声明了但未安装的插件会让 Harness 启动失败）。
+function profilesWithManifest(dshHome) {
+  const profilesDir = join(dshHome, 'profiles')
+  if (!existsSync(profilesDir)) return []
+  return readdirSync(profilesDir, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => join(profilesDir, entry.name))
+    .filter(dir => existsSync(join(dir, 'package.json')))
+}
+
 // 当前 dataRoot 下实际有内容、可被备份的类别 id。
 function availableCategoryIds(dataRoot) {
   return categoryList()
@@ -229,6 +241,7 @@ module.exports = {
   copyBackupSource,
   legacyCategoriesFromEntries,
   parseManifest,
+  profilesWithManifest,
   restoreSources,
   stageBackup,
 }

@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import {
   CATEGORIES,
   applyRestorePlan,
@@ -20,6 +20,7 @@ import {
   categoryList,
   legacyCategoriesFromEntries,
   parseManifest,
+  profilesWithManifest,
   restoreSources,
   stageBackup,
 } from '../src/backup-categories.cjs'
@@ -244,6 +245,33 @@ test('applyRestorePlan replaces, merges and cleans up .bak files', () => {
   } finally {
     rmSync(backup, { recursive: true, force: true })
     rmSync(data, { recursive: true, force: true })
+  }
+})
+
+test('profilesWithManifest returns only profile dirs with a package.json', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-profiles-test-'))
+  try {
+    const profilesDir = join(root, 'dsh-home', 'profiles')
+    mkdirSync(join(profilesDir, 'web'), { recursive: true })
+    mkdirSync(join(profilesDir, 'tui'), { recursive: true })
+    mkdirSync(join(profilesDir, 'no-manifest'), { recursive: true })
+    mkdirSync(join(profilesDir, 'node_modules', 'pkg'), { recursive: true })
+    writeFileSync(join(profilesDir, 'web', 'package.json'), '{"name":"web"}')
+    writeFileSync(join(profilesDir, 'tui', 'package.json'), '{"name":"tui"}')
+    // 无 package.json 的目录与 node_modules 不应被当作 profile
+    const result = profilesWithManifest(join(root, 'dsh-home')).map(dir => dir.split(sep).pop()).sort()
+    assert.deepEqual(result, ['tui', 'web'])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('profilesWithManifest returns empty when profiles dir is missing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-profiles-absent-'))
+  try {
+    assert.deepEqual(profilesWithManifest(join(root, 'dsh-home')), [])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 })
 

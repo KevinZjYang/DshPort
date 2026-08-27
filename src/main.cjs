@@ -15,6 +15,7 @@ const {
   categoryById,
   legacyCategoriesFromEntries,
   parseManifest,
+  profilesWithManifest,
   restoreSources,
   stageBackup,
 } = require('./backup-categories.cjs')
@@ -68,6 +69,8 @@ const TASK_POLL_INTERVAL_MS = 2000
 let interactionSocket = null
 let interactionReconnectTimer = null
 const MUX_RECONNECT_DELAY_MS = 3000
+// 恢复 Harness 设置后重建插件依赖（pnpm install）的超时上限。
+const RESTORE_INSTALL_TIMEOUT_MS = 10 * 60 * 1000
 // 活跃的"等待用户响应"通知：key（approval:<id> / question:<rpcId>）→ Notification。
 const interactionNotifications = new Map()
 
@@ -204,6 +207,50 @@ async function normalizeProfilePnpmStore(webProfileDir) {
     stripPnpmStoreIdentity(modulesDir)
     console.warn('Failed to normalize web profile pnpm store, stripped store identity:', error.message)
   }
+}
+
+// 在指定 profile 目录内用内置 pnpm 执行 install，把声明在 package.json（dependencies）
+// 里的插件补齐全 —— 备份不含 node_modules，恢复后目标设备可能缺少在新设备上
+// 已经声明但未安装的插件（例如 dsh-pocket），缺失会让 Harness 启动时报
+// “cannot resolve profile bundle”。返回 { ok, error }。
+async function reconcileProfileDependencies(profileDir) {
+  // 先修正可能残留的 pnpm store 身份（避免 ERR_PNPM_UNEXPECTED_STORE；
+  // profile 尚无 node_modules 时为空操作）。
+  try { await normalizeProfilePnpmStore(profileDir) } catch {}
+  return new Promise(resolve => {
+    const entry = bundledPnpmEntry()
+    if (entry === null) return resolve({ ok: false, error: 'DshPort 内置 pnpm 不可用' })
+    const child = spawn(entry.nodeExe, [entry.pnpmJs, 'install'], {
+      cwd: profileDir,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    })
+    let stderr = ''
+    const timer = setTimeout(() => { try { child.kill() } catch {} }, RESTORE_INSTALL_TIMEOUT_MS)
+    child.stdout.resume()
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', error => {
+      clearTimeout(timer)
+      resolve({ ok: false, error: error.message })
+    })
+    child.on('close', code => {
+      clearTimeout(timer)
+      if (code === 0) resolve({ ok: true })
+      else resolve({ ok: false, error: (stderr.trim() || `pnpm install 退出码 ${code ?? 'null'}`).slice(0, 800) })
+    })
+  })
+}
+
+// 恢复 Harness 设置后，为所有带 package.json 的 profile 重建依赖。
+// 返回失败清单，供调用方提示用户。
+async function reconcileRestoredProfiles() {
+  const failures = []
+  for (const profileDir of profilesWithManifest(dshHome)) {
+    const result = await reconcileProfileDependencies(profileDir)
+    if (!result.ok) failures.push({ profileDir, error: result.error || '未知错误' })
+  }
+  return { failures }
 }
 
 // 把构建期预置的 web profile（dsh-market 插件市场）播种到 dsh-home：
@@ -1614,6 +1661,9 @@ async function restoreData() {
         `将恢复：${selected.map(id => categoryById(id).label).join('、')}`,
         '日志与更新文件不会被覆盖。',
         '恢复期间 Harness 会短暂停止（如需），完成后自动重启。',
+        ...(selected.includes('harness-settings')
+          ? ['恢复 Harness 设置后会自动重建插件依赖（pnpm install），确保插件可用。']
+          : []),
         `备份文件：${archive}`,
       ].join('\n'),
       buttons: ['取消', '继续恢复'],
@@ -1638,6 +1688,28 @@ async function restoreData() {
     }
     const restored = applyRestorePlan(plan)
     ensureDirectories()
+    // 备份不含 node_modules；恢复 Harness 设置后重建各 profile 的插件依赖，
+    // 否则目标设备上声明了但未安装的插件（如 dsh-pocket）会让 Harness 启动失败。
+    if (restored.includes('harness-settings')) {
+      sendStatus('正在重建 Harness 插件依赖…', 'info')
+      const reconcile = await reconcileRestoredProfiles()
+      if (reconcile.failures.length > 0) {
+        console.warn('Profile dependency reconcile failures:', reconcile.failures)
+        const detail = reconcile.failures.map(f => `${f.profileDir}\n  ${f.error}`).join('\n')
+        await dialog.showMessageBox({
+          type: 'warning',
+          title: APP_NAME,
+          message: '部分插件依赖未能自动安装。',
+          detail: [
+            '备份已恢复，但以下 profile 的插件依赖安装失败（可能是离线或无网络）：',
+            '',
+            detail,
+            '',
+            'Harness 可能因此无法启动。请联网后重试恢复，或在对应 profile 目录手动执行 pnpm install 后再启动。',
+          ].join('\n'),
+        })
+      }
+    }
     if (needsRestart) {
       const url = await startHarness()
       startTaskNotifier(url)
