@@ -88,9 +88,27 @@ DshPort 在生成安装包时把插件市场（dsh-market）预置进内置的 `
 - **插件市场**（[dsh-market](https://github.com/dsh-market/dsh-market)）：打开 Harness 的 **设置 → 插件市场** 即可浏览社区目录（1500+ 插件）、搜索、按分类/星标筛选、一键安装与更新。
 - **其余插件（如 dsh-pocket 手机访问）**：不在默认预置里，但都已收录在插件市场内，可在 **设置 → 插件市场** 一键安装（例如 dsh-pocket 手机访问：扫二维码在手机上实时查看/操控电脑上的 DSH）。
 - **全新安装**：首次启动会把预置插件 profile 复制进 `data/dsh-home/profiles/web/`，无需联网、无需手动安装 pnpm。
-- **已有数据（升级场景）**：若 `web` profile 已存在但缺少内置插件，会在启动时把预置插件离线合并进现有 profile（只增不删，不破坏用户已装的其它插件）。
+- **已有数据（升级场景）**：启动时若发现内置插件**缺失**或**版本落后于本包预置**，会离线覆盖升级该内置插件并同步 `package.json`；**用户自装的其它插件只增不删、不会被覆盖**。
 - 构建期可用环境变量控制：
   - `DSH_PLUGINS=...`：预置的插件清单（空格分隔的包名/规格），默认 `dshmarket`；设为 `0` 或空则跳过预置。
+
+### 升级策略（避免再出现「更新后起不来」）
+
+| 类别 | 策略 |
+|------|------|
+| **Harness + 内置插件（dshmarket）** | 必须一起对齐。升级 harness 时重建 preset（`build-runtime`），启动时再用预置版本覆盖过时的内置插件。 |
+| **用户在插件市场自装的插件** | DshPort **不保证**与任意 harness 版本兼容，也不在升级时自动改写。若某插件导致异常，可在设置里卸载或从 profile 移除。 |
+| **DshPort 壳** | Web UI 挂载、token、EPIPE 等与插件无关；改鉴权/窗口结构时用下面的冒烟脚本验证。 |
+
+升级 harness 或内置插件后，打包前请跑：
+
+```sh
+node scripts/smoke-harness.mjs   # dump-config + 带 token 的 UI 200
+# package.mjs 默认会先跑 smoke-harness；DSHPORT_SKIP_SMOKE=1 可跳过
+node scripts/package.mjs --zip
+node scripts/smoke-package.mjs   # 解压 zip 后真实启动，要求 token URL 返回 200
+```
+
 
 > ⚠️ **许可提示**：DshPort 本身为 MIT；默认预置的 dsh-market 为 MIT。`dsh-pocket` 为 **GPL-2.0**，但**默认不随包分发**，仅在用户通过插件市场自行安装时涉及 GPL 合规。本安装包内置一份 **`THIRD_PARTY_LICENSES.txt`**（随包分发，也在“关于”对话框可查看），列出了内置组件及其许可证与来源，可作为第三方许可声明。
 
@@ -122,6 +140,7 @@ DshPort 是便携应用，没有安装器。可以手动创建桌面/开始菜�
 ```sh
 pnpm install --frozen-lockfile
 node scripts/build-runtime.mjs
+node scripts/smoke-harness.mjs
 node scripts/package.mjs --zip
 ```
 

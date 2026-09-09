@@ -114,6 +114,17 @@ async function main() {
   await cp(join(projectRoot, 'runtime', 'updater'), join(unpackedRoot, 'resources', 'updater'), { recursive: true })
   await verifyPackagedHarness(unpackedRoot)
 
+  // 内置插件与 harness 导出是否对齐 + 带 token 的 UI 是否可打开。
+  // 升级 harness 后这里最容易拦住「dshmarket 还在 import 已删除导出」一类回归。
+  if (process.env.DSHPORT_SKIP_SMOKE !== '1') {
+    const packagedNode = join(unpackedRoot, 'resources', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
+    await run(packagedNode, [
+      join(projectRoot, 'scripts', 'smoke-harness.mjs'),
+      '--harness', join(unpackedRoot, 'resources', 'harness'),
+      '--preset', join(unpackedRoot, 'resources', 'presets', 'web-profile'),
+    ])
+  }
+
   if (wantsZip) {
     const archive = join(outputRoot, 'DshPort-win-x64.zip')
     const harnessArchive = join(outputRoot, 'harness-runtime.zip')

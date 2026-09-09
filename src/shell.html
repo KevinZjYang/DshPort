@@ -151,20 +151,17 @@
       <div class="spinner"></div>
       <div>正在启动 DeepSeek Harness…</div>
     </div>
-    <iframe id="harness" title="DeepSeek Harness" hidden></iframe>
     <script>
-      const frame = document.getElementById('harness')
+      // Harness 本体由主进程 WebContentsView 承载（避开 iframe + SameSite=Strict
+      // 的跨站 Cookie 问题）。这里只负责工具栏与加载态。
       const loading = document.getElementById('loading')
       const statusEl = document.getElementById('status')
 
       function loadUrl(url) {
         if (!url) return
-        frame.src = url
-        frame.hidden = false
         loading.hidden = true
       }
 
-      // Fallback for direct loads with ?url=; normal flow delivers the URL via IPC.
       const initialUrl = new URLSearchParams(location.search).get('url')
       if (initialUrl) loadUrl(initialUrl)
 
@@ -193,8 +190,6 @@
       })
       document.getElementById('restart').addEventListener('click', async () => {
         loading.hidden = false
-        frame.hidden = true
-        frame.src = 'about:blank'
         statusEl.textContent = '正在重启 Harness…'
         statusEl.className = 'status info'
         progressEl.hidden = true

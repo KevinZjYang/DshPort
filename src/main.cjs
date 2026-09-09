@@ -1,4 +1,15 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, Notification, shell, Tray } = require('electron')
+// Windows/父进程 stdio 关闭后，console 写管道会 EPIPE 并把主进程打崩
+// （Electron WebContents 转发 console 时尤其容易踩到）。吞掉即可。
+for (const method of ['log', 'info', 'warn', 'error', 'debug']) {
+  const original = console[method].bind(console)
+  console[method] = (...args) => {
+    try {
+      original(...args)
+    } catch {}
+  }
+}
+
+const { app, BrowserWindow, WebContentsView, dialog, ipcMain, Menu, Notification, shell, Tray } = require('electron')
 const { spawn } = require('node:child_process')
 const { createHash, randomUUID } = require('node:crypto')
 const { cpSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
@@ -52,6 +63,8 @@ const settingsFile = join(dataRoot, 'settings.json')
 const pluginPresetDir = join(__dirname, '..', 'resources', 'presets', 'web-profile')
 
 let mainWindow
+let harnessView
+const TOOLBAR_HEIGHT = 40
 let harnessProcess
 let tray = null
 let shuttingDown = false
@@ -59,6 +72,8 @@ let quitting = false
 let suppressHarnessExitError = false
 let restoreInProgress = false
 let activeUrl
+// `dsh web` 打印的带 token 完整地址；没有它 UI 会 401 空白。
+let harnessLaunchUrl
 let pendingUrl
 let windowLoaded = false
 let backgroundDownload = null
@@ -253,10 +268,29 @@ async function reconcileRestoredProfiles() {
   return { failures }
 }
 
+// 读取某目录下已安装包的 version；缺失或损坏返回 null。
+function readInstalledPackageVersion(modulesRoot, name) {
+  try {
+    return JSON.parse(readFileSync(join(modulesRoot, name, 'package.json'), 'utf8')).version || null
+  } catch {
+    return null
+  }
+}
+
+// 内置插件是否需要从 preset 覆盖升级：缺失 → 是；已装但 preset 更新 → 是。
+function bundledPluginNeedsSync(webProfileDir, name) {
+  const installed = readInstalledPackageVersion(join(webProfileDir, 'node_modules'), name)
+  const bundled = readInstalledPackageVersion(join(pluginPresetDir, 'node_modules'), name)
+  if (!bundled) return installed === null
+  if (!installed) return true
+  return compareVersionsSafe(bundled, installed)
+}
+
 // 把构建期预置的 web profile（dsh-market 插件市场）播种到 dsh-home：
 // - 全新安装：profile 目录不存在 → 整体复制预置 preset（离线、开箱即用）。
-// - 升级场景：profile 已存在但缺内置插件 → 把 preset 里的插件包合并进现有
-//   node_modules，并把 preset 的依赖与 bundles 合入 manifest（只增不删）。
+// - 升级场景：profile 已存在但缺内置插件，或内置插件版本落后于 preset →
+//   把 preset 里的插件包合并进现有 node_modules（只增/只升内置项，不删用户插件），
+//   并把 preset 的依赖与 bundles 合入 manifest。
 // 任何失败都只记日志、不阻塞 Harness 启动（插件缺失时 Harness 仍会正常初始化 profile）。
 // 播种完成后（无论全新还是合并、甚至已就绪），都会试着修正 pnpm store 身份，
 // 否则市场里的安装/更新会因打包机的 store 路径被 pnpm 拒绝。
@@ -276,26 +310,31 @@ function seedPluginPreset() {
       return
     }
   } else {
-    // 升级/已有 profile：离线补齐内置插件，保留用户原有插件。
+    // 升级/已有 profile：离线补齐/升级内置插件，保留用户原有插件。
     try {
       const preset = JSON.parse(readFileSync(presetManifest, 'utf8'))
       const presetDependencies = preset.dependencies || {}
       const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
       const dependencies = manifest.dependencies || {}
-      if (!Object.keys(presetDependencies).every(name => {
-        return Object.prototype.hasOwnProperty.call(dependencies, name)
-      })) {
+      const staleNames = Object.keys(presetDependencies).filter(name => bundledPluginNeedsSync(webProfileDir, name))
+      if (staleNames.length > 0) {
         const presetModules = join(pluginPresetDir, 'node_modules')
+        mkdirSync(join(webProfileDir, 'node_modules'), { recursive: true })
         if (existsSync(presetModules)) {
-          mkdirSync(join(webProfileDir, 'node_modules'), { recursive: true })
-          for (const name of readdirSync(presetModules)) {
-            if (name === '.bin' || name === '.pnpm' || name === '.package-lock.json') continue
+          for (const name of staleNames) {
             const source = join(presetModules, name)
+            if (!existsSync(source)) continue
             const target = join(webProfileDir, 'node_modules', name)
-            if (!existsSync(target)) cpSync(source, target, { recursive: true })
+            // 先删再拷，避免 Windows 上目录覆盖不完整。
+            rmSync(target, { recursive: true, force: true })
+            cpSync(source, target, { recursive: true })
           }
         }
         const mergedDependencies = { ...dependencies }
+        for (const name of staleNames) {
+          mergedDependencies[name] = presetDependencies[name]
+        }
+        // 非内置、用户后装的依赖保持原样；preset 里缺失的名字若已存在也保留。
         for (const [name, spec] of Object.entries(presetDependencies)) {
           if (!Object.prototype.hasOwnProperty.call(mergedDependencies, name)) mergedDependencies[name] = spec
         }
@@ -310,7 +349,25 @@ function seedPluginPreset() {
           dsh: { ...manifest.dsh, profile: { ...(manifest.dsh?.profile || {}), bundles: mergedBundles } },
         }
         writeFileSync(manifestPath, `${JSON.stringify(next, null, 2)}\n`)
-        console.log('Merged bundled plugins into existing web profile')
+        console.log(`Synced bundled plugins into existing web profile: ${staleNames.join(', ')}`)
+      } else {
+        // 名称齐全且版本不落后时，仍补齐可能被删掉的 bundle 项。
+        const presetBundles = preset.dsh?.profile?.bundles || []
+        const mergedBundles = [...(manifest.dsh?.profile?.bundles || [])]
+        let bundlesChanged = false
+        for (const id of presetBundles) {
+          if (!mergedBundles.includes(id)) {
+            mergedBundles.push(id)
+            bundlesChanged = true
+          }
+        }
+        if (bundlesChanged) {
+          writeFileSync(manifestPath, `${JSON.stringify({
+            ...manifest,
+            dsh: { ...manifest.dsh, profile: { ...(manifest.dsh?.profile || {}), bundles: mergedBundles } },
+          }, null, 2)}\n`)
+          console.log('Merged missing plugin bundles into existing web profile')
+        }
       }
     } catch (error) {
       console.warn('Failed to merge bundled plugin preset:', error.message)
@@ -370,11 +427,24 @@ function waitForUrl(url, timeoutMs = 60000) {
   })
 }
 
+function originOf(url) {
+  try {
+    return new URL(url).origin
+  } catch {
+    return String(url || '').replace(/\/?\?[\s\S]*$/u, '')
+  }
+}
+
 async function startHarness() {
   const port = Number(process.env.DSH_PORT || await findFreePort() || DEFAULT_PORT)
   spawnHarness(port)
   activeUrl = await waitForUrl(`http://127.0.0.1:${port}`)
-  return activeUrl
+  // waitForUrl 在 401（未带 token）时就会成功，必须再等 stdout 上的 token URL。
+  const started = Date.now()
+  while (!harnessLaunchUrl && Date.now() - started < 20000) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  return harnessLaunchUrl || activeUrl
 }
 
 function spawnHarness(port) {
@@ -408,6 +478,14 @@ function spawnHarness(port) {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   harnessProcess = child
+  harnessLaunchUrl = undefined
+  let stdoutBuf = ''
+  child.stdout.on('data', chunk => {
+    stdoutBuf += chunk.toString('utf8')
+    const match = /https?:\/\/127\.0\.0\.1:\d+\/?\?token=[A-Za-z0-9_\-.%]+/u.exec(stdoutBuf)
+    if (match) harnessLaunchUrl = match[0]
+    if (stdoutBuf.length > 8192) stdoutBuf = stdoutBuf.slice(-4096)
+  })
   child.stdout.pipe(logStream)
   child.stderr.pipe(logStream)
   child.once('error', error => {
@@ -433,6 +511,7 @@ function stopHarness() {
   return new Promise(resolve => {
     const child = harnessProcess
     harnessProcess = undefined
+    harnessLaunchUrl = undefined
     if (!child || child.killed) return resolve()
     child.once('exit', resolve)
     child.kill()
@@ -457,10 +536,60 @@ async function restartHarness() {
   }
 }
 
+function layoutHarnessView() {
+  if (!mainWindow || mainWindow.isDestroyed() || !harnessView) return
+  const [width, height] = mainWindow.getContentSize()
+  harnessView.setBounds({
+    x: 0,
+    y: TOOLBAR_HEIGHT,
+    width: Math.max(0, width),
+    height: Math.max(0, height - TOOLBAR_HEIGHT),
+  })
+}
+
+function destroyHarnessView() {
+  if (!harnessView) return
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.contentView.removeChildView(harnessView)
+    }
+  } catch {}
+  try {
+    harnessView.webContents.close()
+  } catch {}
+  harnessView = undefined
+}
+
+// Harness 认证 Cookie 是 SameSite=Strict。用 file:// 的 shell 在 iframe 里嵌
+// http://127.0.0.1 时属于跨站，Cookie 发不出去，页面会 401 空白。改成顶层
+// WebContentsView 承载 Harness，浏览上下文自身就是 127.0.0.1，工具栏仍留在
+// 主窗口 shell 里。
+function attachHarnessView(url) {
+  if (!mainWindow || mainWindow.isDestroyed() || !url) return
+  // 极旧 Electron 没有 WebContentsView 时退回整窗导航（会丢工具栏，但至少能用）。
+  if (typeof WebContentsView !== 'function') {
+    mainWindow.loadURL(url)
+    return
+  }
+  if (!harnessView) {
+    harnessView = new WebContentsView({
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    })
+    mainWindow.contentView.addChildView(harnessView)
+  }
+  layoutHarnessView()
+  harnessView.webContents.loadURL(url)
+  // 隐藏 shell 里的加载态/iframe，内容区由 WebContentsView 覆盖。
+  mainWindow.webContents.send('harness-url', url)
+}
+
 function sendUrlToWindow(url) {
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (windowLoaded) {
-    mainWindow.webContents.send('harness-url', url)
+    attachHarnessView(url)
   } else {
     pendingUrl = url
   }
@@ -519,21 +648,23 @@ function notifyTaskCompleted({ sessionId, title }) {
 
 function startTaskNotifier(url) {
   stopTaskNotifier()
+  // API/WS 轮询只用 origin；带 ?token= 的启动地址不能直接拼路径。
+  const origin = originOf(url)
   const tracker = createTaskTracker()
   let polling = false
   const timer = setInterval(async () => {
     if (polling) return
     polling = true
     try {
-      const items = await pollSessionList(url)
+      const items = await pollSessionList(origin)
       for (const completed of tracker.ingest(items)) notifyTaskCompleted(completed)
     } finally {
       polling = false
     }
   }, TASK_POLL_INTERVAL_MS)
   timer.unref?.()
-  taskNotifier = { tracker, timer, url }
-  startInteractionNotifier(url)
+  taskNotifier = { tracker, timer, url: origin }
+  startInteractionNotifier(origin)
 }
 
 function stopTaskNotifier() {
@@ -675,12 +806,13 @@ function createWindow() {
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
     console.warn(`shell load failed: ${code} ${description}`)
   })
+  mainWindow.on('resize', layoutHarnessView)
   // shell.html shows a loading screen; the harness URL arrives via IPC once ready.
   mainWindow.loadFile(join(__dirname, 'shell.html'))
   mainWindow.webContents.once('did-finish-load', () => {
     windowLoaded = true
     if (pendingUrl) {
-      mainWindow.webContents.send('harness-url', pendingUrl)
+      attachHarnessView(pendingUrl)
       pendingUrl = undefined
     }
   })
@@ -701,6 +833,7 @@ function createWindow() {
     }
   })
   mainWindow.on('closed', () => {
+    destroyHarnessView()
     mainWindow = undefined
   })
 }
