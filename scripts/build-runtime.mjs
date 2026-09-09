@@ -2,6 +2,7 @@ import { createWriteStream } from 'node:fs'
 import { access, cp, lstat, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import sharp from 'sharp'
@@ -127,6 +128,7 @@ async function prepareHarness() {
   await mkdir(harnessRoot, { recursive: true })
   await installDshPackage(await resolveDshPackageSpec())
   await exposeInstalledDshPackage()
+  await verifyShippedPresetRoot()
   await pruneHarnessRuntime()
   await verifyMaterializedWorkspacePackages(join(harnessRoot, 'node_modules', '@deepseek-ai'))
   await verifyRuntimeDependency(join(harnessRoot, 'node_modules', 'yaml', 'dist', 'doc', 'directives.js'))
@@ -167,10 +169,35 @@ async function resolveDshPackageSpec() {
 async function exposeInstalledDshPackage() {
   const dshPackageRoot = join(harnessRoot, 'node_modules', '@deepseek-ai', 'dsh')
   await cp(join(dshPackageRoot, 'lib'), join(harnessRoot, 'lib'), { recursive: true })
-  await cp(join(dshPackageRoot, 'config'), join(harnessRoot, 'config'), { recursive: true })
+  // @deepseek-ai/dsh 0.1.2-rc.1 起不再随包发布 `config/`：内置 agent preset 改由
+  // 依赖包 @deepseek-ai/dsh-agent-presets 携带，`SHIPPED_PRESET_ROOT` 相对该包自身
+  // 解析，与 CLI 的 lib 副本位置无关。旧版本（≤ 0.1.1-rc.2）的 profile-boot 按
+  // `../config/agent-presets` 相对 lib 解析，所以那时必须把 config/ 复制到 harness
+  // 根目录。这里按存在与否复制，两种包布局都能用。
+  const configSource = join(dshPackageRoot, 'config')
+  if (await exists(configSource)) await cp(configSource, join(harnessRoot, 'config'), { recursive: true })
   for (const file of ['package.json', 'README.md', 'README.zh.md', 'README.i18n.yaml', 'LICENSE']) {
     if (await exists(join(dshPackageRoot, file))) await cp(join(dshPackageRoot, file), join(harnessRoot, file))
   }
+}
+
+// 内置 agent preset 必须有落地的目录，否则运行时没有任何可选 preset。新版随
+// @deepseek-ai/dsh-agent-presets 发布，旧版随 dsh 包的 config/ 发布；两处都没有
+// 就说明上游打包方式又变了，构建应立刻失败而不是产出一个缺 preset 的包。
+async function verifyShippedPresetRoot() {
+  const candidates = [join(harnessRoot, 'config', 'agent-presets')]
+  // 新版由依赖包携带 preset，按 Node 的解析规则定位包目录，兼容 npm 提升与嵌套两种安装布局。
+  try {
+    const require = createRequire(join(harnessRoot, 'lib', 'bin.js'))
+    const packageDir = dirname(require.resolve('@deepseek-ai/dsh-agent-presets/package.json'))
+    candidates.push(join(packageDir, 'presets'))
+  } catch {
+    // 旧版本没有这个包，preset 随 dsh 包的 config/ 发布。
+  }
+  for (const candidate of candidates) {
+    if (await exists(join(candidate, 'standard', 'agent.cordis.yml'))) return
+  }
+  throw new Error(`Shipped agent presets are missing; checked ${candidates.join(' and ')}`)
 }
 
 async function pruneHarnessRuntime() {
