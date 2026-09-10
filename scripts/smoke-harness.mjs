@@ -107,7 +107,7 @@ async function fetchUi(launchUrl) {
 
 async function seedHome(home) {
   if (!existsSync(presetRoot)) {
-    throw new Error(`preset profile not found: ${presetRoot}（先跑 node scripts/build-runtime.mjs）`)
+    throw new Error(`preset profile not found: ${presetRoot}（先跑 node scripts/build-runtime.mjs；打包产物内应位于 resources/app/resources/presets/web-profile）`)
   }
   await cp(presetRoot, join(home, 'profiles', 'web'), { recursive: true })
 }
